@@ -23,7 +23,11 @@ import { notifyGrokBotIndex } from '../../integrations/GrokBotIndexWriter.js';
 import { updateFolderClaudeMdFiles } from '../../../utils/claude-md-utils.js';
 import { getWorkerPort } from '../../../shared/worker-utils.js';
 import { recordObserverFailure, recordObserverSuccess } from '../../../shared/observer-health.js';
-import { clearQuotaCooldown, routeAroundUnservableProviderIfLoaded } from '../../../shared/quota-cooldown.js';
+import {
+  clearQuotaCooldown,
+  routeAroundUnservableProviderIfLoaded,
+  syncObserverHealthQuotaCooldown,
+} from '../../../shared/quota-cooldown.js';
 import { recycleObserverConversation } from '../session/recycle-conversation.js';
 import { OBSERVER_TEXT_RATE_LIMIT_ABORT_REASON } from '../session/abort-reason.js';
 import { clearRejectedOutput, recordRejectedOutput } from '../session/OutputRecovery.js';
@@ -41,6 +45,7 @@ import { observationMediaFromMetadata } from '../../media/feed.js';
 import { captureOnlyLinkWrites, hasWaitingCaptureOnlyEvents, skippedTurnCaptureOnlyLinkWrites, withWaitingCaptureOnlyLinkWrites, writeMediaEventResults, writeObservationMediaLinks, type MediaLinkageWriteResult, type ObservationLinkWrite } from '../../media/linkage.js';
 import { deriveLineAnchors, lineAnchorsForObservation, withLineAnchors, type LineAnchor } from '../../../shared/line-anchors.js';
 import { normalizePlatformSource } from '../../../shared/platform-source.js';
+import { hasSummaryProgress } from './summary-content.js';
 import type { Database } from 'bun:sqlite';
 
 type ObservationFileEvidenceMessage = Pick<PendingMessage, 'type' | 'tool_name' | 'tool_input' | 'tool_response'>;
@@ -412,9 +417,9 @@ function errorCode(error: unknown): string {
  * Record a confirmed-without-storage outcome (skip, dropped batch) on the
  * turn's source events before the batch is confirmed, and hand the turn's
  * images on within its prompt (capture-only linkage, a turn that stored no
- * observation). A failure of the outcome write propagates, so the batch is not
- * confirmed with its events still unprocessed (a replay would otherwise
- * re-queue them); a failed link write only degrades the images to event-level.
+ * observation). An outcome-write failure propagates to the caller; terminal
+ * answered batches report the durability gap and still settle their inference
+ * work. A failed link write only degrades the images to event-level.
  */
 function recordSkippedMediaEvents(dbManager: DatabaseManager, keys: TurnMediaEventKeys, sessionDbId: number, promptNumber: number): void {
   if (!hasMediaEvents(keys)) return;
@@ -432,6 +437,72 @@ function recordSkippedMediaEvents(dbManager: DatabaseManager, keys: TurnMediaEve
     eventLevelRefs: linkResult.eventLevelRefs,
   });
   if (linkResult.changedNativeRows.length > 0) dbManager.getCloudSync()?.notify();
+}
+
+/**
+ * Release the quota breaker after the provider answered a turn. Codex clears
+ * its breaker in query using the admitted cooldown identity: an earlier
+ * response here must not erase a newer failure from a concurrent pool slot.
+ * A quota-fallback run proves its own credential works, not the spent primary one.
+ *
+ * Every clear restates the SessionStart notice from the settings in force now.
+ * Codex skips the clear here, so it restates the notice itself: otherwise a
+ * Claude hold mirrored before CLAUDE_MEM_PROVIDER was switched to codex keeps
+ * saying capture is paused while Codex is saving (#6372).
+ */
+function releaseQuotaBreaker(session: ActiveSession): void {
+  if (session.currentProvider === 'codex') {
+    syncObserverHealthQuotaCooldown();
+  } else if (session.currentProvider && !session.claudeAuthOverride) {
+    clearQuotaCooldown(session.currentProvider);
+  }
+}
+
+/** End an answered turn without a memory row, keeping its source and receipts. */
+async function confirmWithoutStorage(
+  session: ActiveSession,
+  context: ResponseContext,
+  dbManager: DatabaseManager,
+  sessionManager: SessionManager,
+  worker: WorkerRef | undefined,
+): Promise<void> {
+  session.lastSummaryStored = false;
+  try {
+    recordSkippedMediaEvents(dbManager, turnMediaEventKeys(context, sessionManager, session.sessionDbId), session.sessionDbId, context.promptNumber);
+  } catch (error) {
+    // A DB failure cannot turn an answered batch into another paid request.
+    // Keep original media evidence; report the missing result/link separately.
+    logger.error('DB', 'Answered batch media outcome could not be saved; no inference replay', {
+      sessionId: session.sessionDbId, code: errorCode(error),
+    });
+  }
+  const toolUseIds = Array.from(new Set(
+    sessionManager.getClaimedMessages(session.sessionDbId)
+      .map(message => message.toolUseId)
+      .filter((id): id is string => typeof id === 'string' && id.length > 0)
+  ));
+  // A final answer with no memory still spent this batch's budget. Do not
+  // let a later hook/transcript delivery buy another send of the same event.
+  if (toolUseIds.length > 0) {
+    try {
+      dbManager.getSessionStore().markCommittedToolUses({
+        platformSource: session.platformSource,
+        contentSessionId: session.contentSessionId,
+        toolUseIds,
+      });
+    } catch (error) {
+      // The live buffer still remembers these tool IDs. Durability is degraded,
+      // not repaired by regenerating a response or persisting inference work.
+      logger.error('DB', 'Answered batch completion receipt could not be saved; no inference replay', {
+        sessionId: session.sessionDbId, code: errorCode(error),
+      });
+    }
+  }
+  session.pendingAgentId = null;
+  session.pendingAgentType = null;
+  await sessionManager.confirmClaimedMessages(session.sessionDbId);
+  session.earliestPendingTimestamp = null;
+  worker?.broadcastProcessingStatus?.();
 }
 
 /**
@@ -931,6 +1002,22 @@ export async function processAgentResponse(
     return null;
   }
 
+  // A parseable title/plan is an answered request, but not progress worth
+  // saving. Keep this out of the invalid-XML recovery path: that path retries
+  // and can route to another provider. Settle only this batch, even before a
+  // memory session ID arrives, so fresh work can continue without a new send.
+  if (parsed.summary && !parsed.summary.skipped && !hasSummaryProgress(text)) {
+    clearRejectedOutput(session);
+    clearDebtForAnsweredWork(session);
+    logger.warn('PARSER', 'Summary has no progress content; not storing or retrying the answered batch', {
+      sessionId: session.sessionDbId,
+      reason: 'missing_progress_content',
+      ...(finishReason ? { finishReason, truncated: isOutputCapFinishReason(finishReason) } : {}),
+    });
+    await confirmWithoutStorage(session, context, dbManager, sessionManager, worker);
+    return null;
+  }
+
   // A reply cut off at the output-token cap can still hold complete blocks.
   // They are stored, but the unfinished tail is lost, so say so: hitting the
   // cap is never silent. A provider that reports no finish reason (the Claude
@@ -958,25 +1045,8 @@ export async function processAgentResponse(
     // memory session id: confirm it now. Resetting it to pending re-asked the
     // same batch, for the same final answer, until the id appeared.
     if (parsed.summary?.skipped) {
-      session.lastSummaryStored = false;
-      recordSkippedMediaEvents(dbManager, turnMediaEventKeys(context, sessionManager, session.sessionDbId), session.sessionDbId, context.promptNumber);
-      const skippedToolUseIds = Array.from(new Set(
-        sessionManager.getClaimedMessages(session.sessionDbId)
-          .map(message => message.toolUseId)
-          .filter((id): id is string => typeof id === 'string' && id.length > 0)
-      ));
-      // Terminal even when the reply was cut off (logged above): a restart
-      // never authorizes re-spending on work the observer already answered.
-      if (skippedToolUseIds.length > 0) {
-        dbManager.getSessionStore().markCommittedToolUses({
-          platformSource: session.platformSource,
-          contentSessionId: session.contentSessionId,
-          toolUseIds: skippedToolUseIds,
-        });
-      }
-      await sessionManager.confirmClaimedMessages(session.sessionDbId);
-      session.earliestPendingTimestamp = null;
-      worker?.broadcastProcessingStatus?.();
+      await confirmWithoutStorage(session, context, dbManager, sessionManager, worker);
+      releaseQuotaBreaker(session);
       return null;
     }
     logger.warn('SDK', 'memorySessionId not yet captured; deferring storage until next round', {
@@ -1189,15 +1259,15 @@ export async function processAgentResponse(
   // A store that wrote memory proves the observer pipeline works end-to-end — clear
   // the failure streak in the observer-health ledger, and release any quota
   // breaker so a re-probe that succeeds restores full speed at once rather
-  // than waiting out the remaining cooldown (#3634). Codex clears its breaker
-  // in query using the admitted cooldown identity: storing an earlier response
-  // here must not erase a newer failure from a concurrent pool slot.
+  // than waiting out the remaining cooldown (#3634). A valid <skip_summary/>
+  // writes no memory but still proves the provider is serving, so it releases
+  // the breaker too; without that a probe session that only skips re-probes
+  // forever (#6322).
   if (result.observationIds.length > 0 || result.summaryId !== null) {
     recordObserverSuccess();
-    // A quota-fallback run proves its own credential works, not the spent primary one.
-    if (session.currentProvider && session.currentProvider !== 'codex' && !session.claudeAuthOverride) {
-      clearQuotaCooldown(session.currentProvider);
-    }
+    releaseQuotaBreaker(session);
+  } else if (parsed.summary?.skipped) {
+    releaseQuotaBreaker(session);
   }
 
   // Telemetry: counts, enums, and REAL usage only (lastUsage is never an
@@ -1547,7 +1617,6 @@ async function syncAndBroadcastObservations(
       updateFolderClaudeMdFiles(
         allFilePaths,
         context.project,
-        getWorkerPort(),
         projectRoot
       ).catch(error => {
         logger.warn('FOLDER_INDEX', 'CLAUDE.md update failed (non-critical)', { project: context.project }, error as Error);

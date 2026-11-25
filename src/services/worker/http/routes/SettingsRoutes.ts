@@ -18,6 +18,7 @@ import { parseContextCountValue } from '../../../../shared/context-count.js';
 import { OPENROUTER_REASONING_EFFORTS, parseOpenRouterReasoningEffort } from '../../OpenRouterProvider.js';
 import { parseOpenAICompatReasoning } from '../../reasoning-budget.js';
 import { parseProviderBySource } from '../../../../shared/provider-by-source.js';
+import { OPENAI_COMPAT_REASONING_EFFORTS, parseOpenAICompatReasoningEffort, QUOTA_FALLBACK_OPTIONS } from '../../../../ui/provider-options.js';
 import { CODEX_REASONING_EFFORTS, isCodexReasoningEffort } from '../../CodexProvider.js';
 import { emitContextInvalidation, noteUserSettingsSaved } from '../../../../shared/context-invalidation.js';
 import { WORK_VIEW_AGENT_CHOICES } from '../../../work-view/refresh-task.js';
@@ -49,7 +50,6 @@ const SECRET_SETTING_KEYS = new Set([
   'CLAUDE_MEM_TELEGRAM_WRAPUP_ROUTES',
   'CLAUDE_MEM_SERVER_API_KEY',
   'CLAUDE_MEM_SERVER_BETA_API_KEY',
-  'CLAUDE_MEM_TV_TOKEN',
   'CLAUDE_MEM_LOCAL_API_TOKEN',
   'CLAUDE_MEM_WORKER_INGEST_TOKEN',
   'CLAUDE_MEM_PRO_MEMORY_KEY',
@@ -132,7 +132,7 @@ function withoutEnvironmentEchoes(posted: Record<string, unknown>, settingsPath:
 // every secret live — an HTTP-writable redirect hands them to any caller that
 // reaches the API. CLAUDE_MEM_WORKER_HOST decides the bind interface; changing
 // it remotely could re-expose the worker on a non-loopback address without
-// the Observation TV guard's token ever being written. The auto-update pair
+// the local API token ever being written. The auto-update pair
 // decides what the installer runs on this machine:
 // CLAUDE_MEM_AUTO_UPDATE_PROMOTED_RELEASE_URL names the file that picks the
 // version `npx claude-mem@<version> update` installs (the updater reads it
@@ -156,6 +156,10 @@ export const FILE_ONLY_SETTING_KEYS = new Set([
   'CLAUDE_MEM_OPENAI_COMPAT_BASE_URL',
   'CLAUDE_MEM_OPENAI_COMPAT_PRESET',
   'CLAUDE_MEM_LOCAL_API_TOKEN',
+  // It decides which host receives that token, so it is part of the same boundary:
+  // a caller that could point it at its own host over HTTP would only have to wait
+  // for the next hook to hand it the token (#6390).
+  'CLAUDE_MEM_LOCAL_API_TOKEN_REMOTE_HOST',
 ]);
 
 const LOOPBACK_HOSTNAMES = new Set(['localhost', '127.0.0.1', '::1', '[::1]']);
@@ -297,7 +301,7 @@ export class SettingsRoutes extends BaseRouteHandler {
     // trusts loopback — so any page that can reach this origin could set one
     // of these. Secrets stay off this list except the two provider keys the
     // viewer Settings UI must save (Gemini / OpenRouter); those are masked on
-    // GET and an unchanged mask is skipped on POST. Observation TV / Chroma /
+    // GET and an unchanged mask is skipped on POST. Local API / Chroma /
     // Telegram / CloudSync / Redis tokens remain file/env only.
     //
     // Executable spawn paths (CLAUDE_CODE_PATH, CLAUDE_MEM_CODEX_PATH,
@@ -331,6 +335,7 @@ export class SettingsRoutes extends BaseRouteHandler {
       // choose the model and reasoning policy for the configured endpoint.
       'CLAUDE_MEM_OPENAI_COMPAT_MODEL',
       'CLAUDE_MEM_OPENAI_COMPAT_REASONING',
+      'CLAUDE_MEM_OPENAI_COMPAT_REASONING_EFFORT',
       'CLAUDE_MEM_OPENROUTER_REASONING_EFFORT',
       'CLAUDE_MEM_OBSERVER_CONTEXT_WINDOW',
       'CLAUDE_MEM_OBSERVER_MAX_OUTPUT_TOKENS',
@@ -343,6 +348,7 @@ export class SettingsRoutes extends BaseRouteHandler {
       'CLAUDE_MEM_WORK_VIEW_CLAUDE_MODEL',
       'CLAUDE_MEM_WORK_VIEW_CODEX_MODEL',
       'CLAUDE_MEM_WORK_VIEW_GEMINI_MODEL',
+      'CLAUDE_MEM_WORK_VIEW_OPENCODE_MODEL',
       'CLAUDE_MEM_WORK_VIEW_API_MODEL',
       'CLAUDE_MEM_CORPUS_AGENT',
       'CLAUDE_MEM_LOG_LEVEL',
@@ -466,10 +472,8 @@ export class SettingsRoutes extends BaseRouteHandler {
 
     // Empty is valid: it means the default, the Anthropic plan. 'off' turns it off.
     if (settings.CLAUDE_MEM_QUOTA_FALLBACK_PROVIDER) {
-      // The names provider-dispatch's QUOTA_FALLBACK_PROVIDERS accepts, plus QUOTA_FALLBACK_OFF.
-      const validFallbacks = ['claude', 'gemini', 'openrouter', 'openai-compatible', 'off'];
-      if (!validFallbacks.includes(settings.CLAUDE_MEM_QUOTA_FALLBACK_PROVIDER)) {
-        return { valid: false, error: 'CLAUDE_MEM_QUOTA_FALLBACK_PROVIDER must be "claude" (or empty, the default), "gemini", "openrouter", "openai-compatible", or "off"' };
+      if (!(QUOTA_FALLBACK_OPTIONS as readonly string[]).includes(settings.CLAUDE_MEM_QUOTA_FALLBACK_PROVIDER)) {
+        return { valid: false, error: 'CLAUDE_MEM_QUOTA_FALLBACK_PROVIDER must be empty (default) or one of: ' + QUOTA_FALLBACK_OPTIONS.join(', ') };
       }
     }
 
@@ -532,12 +536,12 @@ export class SettingsRoutes extends BaseRouteHandler {
 
     if (settings.CLAUDE_MEM_WORKER_HOST) {
       const host = settings.CLAUDE_MEM_WORKER_HOST;
-      // Loopback, plus the documented bind-all addresses used by Observation TV
-      // and Docker (docs/public/configuration.mdx). Arbitrary IPv4 used to be
+      // Loopback, plus the documented bind-all addresses used by Docker and
+      // remote capture (docs/public/configuration.mdx). Arbitrary IPv4 used to be
       // accepted and would expose the unauthenticated worker API on that NIC.
       const validHostPattern = /^(127\.0\.0\.1|0\.0\.0\.0|::1|::|localhost)$/;
       if (!validHostPattern.test(host)) {
-        return { valid: false, error: 'CLAUDE_MEM_WORKER_HOST must be a loopback address (127.0.0.1, ::1, localhost) or a bind-all address (0.0.0.0, ::) for Observation TV / Docker' };
+        return { valid: false, error: 'CLAUDE_MEM_WORKER_HOST must be a loopback address (127.0.0.1, ::1, localhost) or a bind-all address (0.0.0.0, ::) for Docker / remote capture' };
       }
     }
 
@@ -647,6 +651,12 @@ export class SettingsRoutes extends BaseRouteHandler {
       return { valid: false, error: `CLAUDE_MEM_OPENROUTER_REASONING_EFFORT must be empty or one of: ${OPENROUTER_REASONING_EFFORTS.join(', ')}` };
     }
 
+    if (settings.CLAUDE_MEM_OPENAI_COMPAT_REASONING_EFFORT !== undefined
+      && !(typeof settings.CLAUDE_MEM_OPENAI_COMPAT_REASONING_EFFORT === 'string' && settings.CLAUDE_MEM_OPENAI_COMPAT_REASONING_EFFORT.trim() === '')
+      && !parseOpenAICompatReasoningEffort(settings.CLAUDE_MEM_OPENAI_COMPAT_REASONING_EFFORT)) {
+      return { valid: false, error: `CLAUDE_MEM_OPENAI_COMPAT_REASONING_EFFORT must be empty or one of: ${OPENAI_COMPAT_REASONING_EFFORTS.join(', ')}` };
+    }
+
     if (settings.CLAUDE_MEM_OPENAI_COMPAT_REASONING !== undefined
       && parseOpenAICompatReasoning(settings.CLAUDE_MEM_OPENAI_COMPAT_REASONING) === undefined) {
       return { valid: false, error: 'CLAUDE_MEM_OPENAI_COMPAT_REASONING must be "off" (default) or "on"' };
@@ -654,7 +664,7 @@ export class SettingsRoutes extends BaseRouteHandler {
 
     if (settings.CLAUDE_MEM_WORK_VIEW_AGENT !== undefined
       && !(WORK_VIEW_AGENT_CHOICES as readonly string[]).includes(settings.CLAUDE_MEM_WORK_VIEW_AGENT)) {
-      return { valid: false, error: 'CLAUDE_MEM_WORK_VIEW_AGENT must be empty (follow CLAUDE_MEM_PROVIDER), "claude-code", "codex", "gemini", "api", "off", or "all"' };
+      return { valid: false, error: 'CLAUDE_MEM_WORK_VIEW_AGENT must be empty (follow CLAUDE_MEM_PROVIDER), "claude-code", "codex", "gemini", "opencode", "api", "off", or "all"' };
     }
     if (settings.CLAUDE_MEM_CORPUS_AGENT !== undefined
       && !(CORPUS_AGENT_CHOICES as readonly string[]).includes(settings.CLAUDE_MEM_CORPUS_AGENT)) {
@@ -668,7 +678,7 @@ export class SettingsRoutes extends BaseRouteHandler {
       && (typeof settings.CLAUDE_MEM_WORK_VIEW_COPY_MODEL !== 'string' || settings.CLAUDE_MEM_WORK_VIEW_COPY_MODEL.length > 200)) {
       return { valid: false, error: 'CLAUDE_MEM_WORK_VIEW_COPY_MODEL must be a string of at most 200 characters' };
     }
-    for (const key of ['CLAUDE_MEM_WORK_VIEW_CLAUDE_MODEL', 'CLAUDE_MEM_WORK_VIEW_CODEX_MODEL', 'CLAUDE_MEM_WORK_VIEW_GEMINI_MODEL', 'CLAUDE_MEM_WORK_VIEW_API_MODEL'] as const) {
+    for (const key of ['CLAUDE_MEM_WORK_VIEW_CLAUDE_MODEL', 'CLAUDE_MEM_WORK_VIEW_CODEX_MODEL', 'CLAUDE_MEM_WORK_VIEW_GEMINI_MODEL', 'CLAUDE_MEM_WORK_VIEW_OPENCODE_MODEL', 'CLAUDE_MEM_WORK_VIEW_API_MODEL'] as const) {
       if (settings[key] !== undefined && (typeof settings[key] !== 'string' || settings[key].length > 200)) {
         return { valid: false, error: `${key} must be a string of at most 200 characters` };
       }

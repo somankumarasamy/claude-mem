@@ -13,6 +13,8 @@
 //   bun request-groups.mjs pending [--days 14] [--limit 48]   groups needing a progress review
 //   bun request-groups.mjs show <groupId>           one group's asks, work lists and dates (only new asks when amending)
 //   bun request-groups.mjs record-progress <file|-> persist one progress review
+//   bun request-groups.mjs title-input [--limit 20]  requests still titled with a copy of their opening ask
+//   bun request-groups.mjs record-titles <file|->   persist written titles for those requests
 //   bun request-groups.mjs story-input              reviews whose facts changed since the last story (all without one)
 //   bun request-groups.mjs record-story <file|->    persist the build story and preferences
 //   bun request-groups.mjs focus-input [--limit 20]  focus areas + one batch of requests still to place
@@ -20,12 +22,12 @@
 //   bun request-groups.mjs record-focus [--limit 20 | --other] <file|->
 //                                                   place requests and propose areas (saved through the worker)
 //   bun request-groups.mjs refresh-needs [--days 14]  what the automatic refresh would do now
-import { Database } from 'bun:sqlite';
+import { createRequire } from 'node:module';
 import { createHash } from 'node:crypto';
 import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { conversationKey, isConversationKey, isHumanActionRequest, originalFor, requestText } from './request-projection.mjs';
+import { conversationKey, copiesOpeningAsk, FOCUS_ASK_CHARS, isConversationKey, isHumanActionRequest, originalFor, placeholderTitleFromAsk, requestText } from './request-projection.mjs';
 import { GOAL_KINDS, goalKindOf, OWNER_GOALS_LIST } from './owner-goals.mjs';
 import { NO_PROJECT, projectRoot, upgradedGroupRoot, withDerivedProjects } from './session-project.mjs';
 import { isOwnerDismissedArea, isPlaceableArea, OTHER_FOCUS_AREA_ID, PROPOSAL_KINDS, readFocus } from './my-focus.mjs';
@@ -73,8 +75,9 @@ function queryInChunks(database, values, sqlFor, parametersFor = (chunk) => chun
 
 // Pass sinceEpoch for a time window, or conversationKeys for specific conversations.
 // fullAsks returns every qualifying ask untruncated (for `show`); listings stay short.
+// Grouping needs the recent window; ordinary candidate listings keep the opening one.
 // excludedPromptIds: hook-recorded prompts the setup scan found an agent wrote (agent-written-prompts.json).
-export function readCandidates(database, { sinceEpoch = 0, conversationKeys = null, fullAsks = false, excludedPromptIds = null }) {
+export function readCandidates(database, { sinceEpoch = 0, conversationKeys = null, fullAsks = false, recentAsks = false, excludedPromptIds = null }) {
   const columns = 'SELECT id, platform_source, content_session_id, project, user_prompt, started_at_epoch FROM sdk_sessions';
   const pairs = conversationKeys?.map((key) => JSON.parse(key).slice(1));
   const stored = pairs
@@ -122,7 +125,7 @@ export function readCandidates(database, { sinceEpoch = 0, conversationKeys = nu
       conversationKey: key, platform: session.platform_source, project: session.project,
       startedAt: iso(original.atEpoch ?? session.started_at_epoch), startedAtEpoch: original.atEpoch ?? session.started_at_epoch,
       lastActivityEpoch: Math.max(lastPrompt, observationsBySession.get(session.id)?.last_epoch ?? 0, lastToolUseBySession.get(session.id) ?? 0, session.started_at_epoch ?? 0),
-      firstAsk: requestText(original.text, 600), asks: fullAsks ? asks : asks.slice(0, 10), askCount: asks.length, original,
+      firstAsk: requestText(original.text, 600), asks: fullAsks ? asks : recentAsks ? asks.slice(-10) : asks.slice(0, 10), askCount: asks.length, original,
       workLists: [], requestIds: [], observationCount: observationsBySession.get(session.id)?.count ?? 0,
       sessionDbId: session.id,
     });
@@ -216,7 +219,7 @@ const emptyGroups = () => ({ version: 1, updatedAt: null, conversations: {}, gro
  * move to that group; others keep their previous group. `projectOf` maps a
  * conversation key to its project: a group holds one project root only, unless
  * the decision names the request's `projectRoot` itself. */
-export function applyGroupDecisions(stored, decisions, now = Date.now(), { projectOf = new Map() } = {}) {
+export function applyGroupDecisions(stored, decisions, now = Date.now(), { projectOf = new Map(), getProjectRoot = projectRoot } = {}) {
   if (!Array.isArray(decisions?.groups)) throw new TypeError('Decisions need a groups array.');
   const next = structuredClone(stored ?? emptyGroups());
   for (const [index, decision] of decisions.groups.entries()) {
@@ -244,14 +247,14 @@ export function applyGroupDecisions(stored, decisions, now = Date.now(), { proje
     if (decision.projectRoot != null && (typeof decision.projectRoot !== 'string' || !decision.projectRoot.trim())) throw new TypeError(`${label}.projectRoot must be a non-empty string when given.`);
     const explicitRoot = decision.projectRoot ?? (next.groups[id]?.rootNamed ? next.groups[id].projectRoot : null);
     const allMembers = [...new Set([...decision.conversations, ...Object.entries(next.conversations).filter(([key, groupId]) => groupId === id && !decision.conversations.includes(key)).map(([key]) => key)])];
-    const storedRoot = upgradedGroupRoot(next.groups[id]?.projectRoot, projectRoot(projectOf.get(next.groups[id]?.anchor)),
-      allMembers.map((key) => projectRoot(projectOf.get(key))));
+    const storedRoot = upgradedGroupRoot(next.groups[id]?.projectRoot, getProjectRoot(projectOf.get(next.groups[id]?.anchor)),
+      allMembers.map((key) => getProjectRoot(projectOf.get(key))));
     // A group decided before its project was known (the "no project" root) takes the root its members show now:
     // its earlier members may still show none, and that does not split it.
     const rootWasUnknown = storedRoot === NO_PROJECT;
     const roots = new Map();
     for (const key of allMembers) {
-      const root = projectRoot(projectOf.get(key));
+      const root = getProjectRoot(projectOf.get(key));
       if (root == null || (rootWasUnknown && root === NO_PROJECT && !decision.conversations.includes(key))) continue;
       roots.set(root, [...(roots.get(root) ?? []), key]);
     }
@@ -362,6 +365,19 @@ function reviewList(value, max, label, options) {
   return list.filter((_, index) => newestIndexes.has(index));
 }
 
+/** On the retry, a preference missing its words or the owner's quote is dropped: neither can be shortened into being,
+ * and the review's state and summary are saved without it. Each drop is named in `droppedPreferences`, apart from the
+ * trimmed fields. */
+function quotedPreferences(list, options) {
+  if (!options.coerce || !Array.isArray(list)) return list;
+  const said = (value) => typeof value === 'string' && value.trim() !== '';
+  return list.filter((preference, index) => {
+    if (said(preference?.preference) && said(preference?.quote)) return true;
+    options.droppedPreferences.add(`preferences[${index}]`);
+    return false;
+  });
+}
+
 // Models sometimes answer one citation as a plain string instead of a list (Oct 25: a review's
 // `evidence: "obs 101"` threw `.map is not a function` and failed the whole refresh run).
 const evidenceList = (value, limit = 8) => (Array.isArray(value) ? value : typeof value === 'string' && value.trim() ? [value] : []).map(String).slice(0, limit);
@@ -399,7 +415,7 @@ export function validateOutcome(outcome, options = {}) {
 /** Progress reviews are agent assessments; keep them bounded and dated. */
 export function validateProgress(entry, knownGroups, options = {}) {
   if (!entry || typeof entry !== 'object') throw new TypeError('Progress must be an object.');
-  options = { coerce: false, coercedFields: new Set(), ...options };
+  options = { coerce: false, coercedFields: new Set(), droppedPreferences: new Set(), ...options };
   const text = (value, max, label, optional = false) => reviewText(value, max, label, { ...options, optional });
   if (!knownGroups[entry.groupId]) throw new TypeError(`Unknown group ${entry.groupId}.`);
   const basis = entry.reviewBasis;
@@ -411,7 +427,7 @@ export function validateProgress(entry, knownGroups, options = {}) {
   for (const field of ['startedAt', 'shippedAt', 'lastActivityAt']) if (!isIsoOrNull(entry[field] ?? null)) throw new TypeError(`${field} must be an ISO date or null.`);
   if (entry.state === 'shipped' && (entry.percent !== 100 || !entry.shippedAt)) throw new TypeError('A shipped request needs percent 100 and shippedAt.');
   if (entry.state !== 'shipped' && entry.shippedAt) throw new TypeError('Only a shipped request has shippedAt.');
-  const milestones = reviewList(entry.milestones, 12, 'milestones', options), preferences = reviewList(entry.preferences, 10, 'preferences', options);
+  const milestones = reviewList(entry.milestones, 12, 'milestones', options), preferences = reviewList(quotedPreferences(entry.preferences, options), 10, 'preferences', options);
   return {
     groupId: entry.groupId, state: entry.state, percent: entry.percent,
     startedAt: entry.startedAt ?? null, shippedAt: entry.shippedAt ?? null, lastActivityAt: entry.lastActivityAt ?? null,
@@ -523,6 +539,17 @@ export function storyParts(narrative) {
   });
 }
 
+/** On the story's one retry, a preference over its 200-character cap is cut to the cap (at a word boundary, with an
+ * ellipsis) instead of refused again: one preference a character over otherwise fails the whole story and its other
+ * preferences. The narrative keeps its own refusal, which asks for a condensed rewrite. Each trimmed preference's label
+ * is added to `coercedFields`, so the refresh can report the trim instead of cutting silently. */
+export function trimStoryPreferences(story, coercedFields = new Set()) {
+  if (!Array.isArray(story?.preferences)) return story;
+  const options = { coerce: true, coercedFields };
+  return { ...story, preferences: story.preferences.map((preference, index) => typeof preference?.preference === 'string' && preference.preference.trim()
+    ? { ...preference, preference: reviewText(preference.preference, 200, `preferences[${index}].preference`, options) } : preference) };
+}
+
 export function validateStory(story) {
   const preferences = boundedList(story?.preferences, 30, 'preferences');
   // The refusal names the target and the parts furthest over budget, so the retry condenses toward the target
@@ -553,6 +580,26 @@ export function validateStory(story) {
   };
 }
 
+/** The story step's input: the reviews to tell, the story they update and its budgets. `story-input` builds it from
+ * the saved story; the worker builds each later part of a story written in parts (#6226) from the part before. */
+export function storyInput(groups, reviews, story) {
+  const update = Number.isFinite(Date.parse(story?.writtenAt ?? ''));
+  // An update only ever added to the story until it reached the cap and every update was refused (Oct 24: 11,958 of 12,000),
+  // so the agent is told the budget and the previous story's length up front.
+  // With only the limit and length, an update at 11,836 of 12,000 still added ~1,300 characters and condensed nothing (Oct 24),
+  // so the room left is spelled out as well.
+  // With room counted up to the cap, updates still aimed at the cap and landed over it (Oct 24–26), so the room is
+  // counted up to the target, and a previous story past the target is first condensed back to it, part by part.
+  const previousNarrativeChars = story?.narrative?.length ?? 0;
+  return { groups, update, narrativeTarget: STORY_NARRATIVE_TARGET, narrativeLimit: STORY_NARRATIVE_MAX, previousNarrativeChars,
+    roomChars: Math.max(0, STORY_NARRATIVE_TARGET - previousNarrativeChars), condenseChars: Math.max(0, previousNarrativeChars - STORY_NARRATIVE_TARGET),
+    previousParts: update ? storyParts(story.narrative) : [], mergeOldestChapters: update ? storyChaptersToMerge(story.narrative) : 0,
+    reviews,
+    // Rules owner-goals put in the story are its own (record-story carries them over): shown here, the story model
+    // would echo them back without their source and when, leaving copies a later owner-goals save cannot replace.
+    previousStory: story && { ...story, preferences: (story.preferences ?? []).filter((preference) => preference?.source !== OWNER_GOALS_LIST) } };
+}
+
 /** Suggestions still waiting for the owner: the judge's mid-band picks (request-judge.mjs) whose
  * request still exists and whose conversation is not in it yet. */
 export function openSuggestions(ledger) {
@@ -564,6 +611,12 @@ export function openSuggestions(ledger) {
       conversationKey, requestId: suggestion.requestId, requestTitle: groups.groups[suggestion.requestId].title,
       confidence: suggestion.confidence, evidence: suggestion.evidence, judge: suggestion.judge, at: suggestion.at ?? null,
     }));
+}
+
+/** The automatic refresh's status, or null when its bytes are not JSON: the next refresh check writes a new one. */
+function readRefreshStatus(dir) {
+  try { return readJson(join(dir, 'refresh.json'), null); }
+  catch (error) { if (error instanceof SyntaxError) return null; throw error; }
 }
 
 /** Everything the monitor needs, read without touching the database. */
@@ -578,7 +631,7 @@ export function readLedger(dir = LEDGER_DIR) {
     if (entry?.groupId && groups.groups[entry.groupId]) progress[entry.groupId] = { ...entry, title: groups.groups[entry.groupId].title };
   }
   return {
-    groups, progress, story: readJson(join(dir, 'story.json'), null), refresh: readJson(join(dir, 'refresh.json'), null),
+    groups, progress, story: readJson(join(dir, 'story.json'), null), refresh: readRefreshStatus(dir),
     agentWrittenPromptIds: new Set(readJson(join(dir, AGENT_WRITTEN_PROMPTS_FILE), { promptIds: [] }).promptIds ?? []),
   };
 }
@@ -620,7 +673,7 @@ function pendingReviews(ledger, database, sinceEpoch) {
 
 /** An ask as the focus step reads it: the 400 characters grouping-input shows of a conversation's opening ask and an
  * open request's anchor ask (groupingInput), so a request is placed on what it was grouped on. */
-const FOCUS_ASK_CHARS = 400;
+export { placeholderTitleFromAsk, copiesOpeningAsk } from './request-projection.mjs';
 /** Conversations per readCandidates call: two bound parameters each, and 400 pairs (800 parameters) stays under
  * SQLite's 999-parameter limit before 3.32, the same chunk readConversationProjects uses. */
 const CONVERSATIONS_PER_QUERY = 400;
@@ -657,9 +710,9 @@ const records = (database, ledger, groupIds, requests) => {
   return groupIds.map((groupId) => requestRecord(ledger, groupId, asks, requests.conversations(groupId)));
 };
 
-function basisForConversations(ledger, groupId, conversations) {
+function basisForConversations(ledger, groupId, conversations, title = ledger.groups.groups[groupId].title) {
   const group = ledger.groups.groups[groupId];
-  return createHash('sha256').update(JSON.stringify({ title: group.title, firstAsk: group.anchorAsk?.text ?? null, conversations })).digest('hex').slice(0, 16);
+  return createHash('sha256').update(JSON.stringify({ title, firstAsk: group.anchorAsk?.text ?? null, conversations })).digest('hex').slice(0, 16);
 }
 
 /** What decides a request's area: its title, its first ask and its conversations. Its review (state, percent, summary)
@@ -691,6 +744,10 @@ function focusRequestIndex(ledger) {
       if (!bases.has(groupId)) bases.set(groupId, basisForConversations(ledger, groupId, conversations(groupId)));
       return bases.get(groupId);
     },
+    /** The basis the request had while it showed the placeholder copied from its ask. Naming (section 3) replaces only
+     * that title, so a placement made under the placeholder still stands once the request is named (focusDue). */
+    placeholderBasis: (groupId) => basisForConversations(ledger, groupId, conversations(groupId),
+      placeholderTitleFromAsk(ledger.groups.groups[groupId].anchorAsk?.text ?? null)),
   };
 }
 
@@ -699,14 +756,20 @@ function focusRequestIndex(ledger) {
  * live area (Other and done areas included) is the owner's and never queued; once its area is dismissed it no longer
  * binds (buildFocusAreas), and the router's placement must stand on its own. A router basis is compared only on the
  * device that wrote it: another device decided on its own copy of the request, and comparing would re-place every
- * request on every device in turn. Placements written without a basis (a seed) count as current. */
+ * request on every device in turn. Placements written without a basis (a seed) count as current, and so does one made
+ * while the request showed the placeholder placeholderTitleFromAsk gives (the judge's title): naming it is not a change,
+ * and treating it as one placed every named request again (133 of 136 on a copy of a real ledger, Nov 18). A copy
+ * worded another way ("Figure it out." for "figure it out") was hashed as written, and once it is named nothing holds
+ * those words (a placement keeps only the hash; sync replaces each request with its portable fields), so that request
+ * is placed once more after naming. None of the 136 was one. */
 function focusDue(ledger, focus, localDeviceId, requests) {
   return Object.keys(ledger.groups.groups).filter((groupId) => {
     const placement = focus.placementsByAnchor.get(ledger.groups.groups[groupId].anchor);
     if (placement?.owner && focus.resolveFocusAreaId(placement.owner.focusAreaId)) return false;
     const router = placement?.router;
     if (!router || !focus.resolveFocusAreaId(router.focusAreaId)) return true;
-    return router.device === localDeviceId && router.basis != null && router.basis !== requests.basis(groupId);
+    return router.device === localDeviceId && router.basis != null && router.basis !== requests.basis(groupId)
+      && router.basis !== requests.placeholderBasis(groupId);
   });
 }
 
@@ -827,6 +890,47 @@ export function validateFocusAnswer(answer, input, ledger, { other = false } = {
   };
 }
 
+/** Whether a request still shows a title copied from its opening ask, whoever copied it. */
+export function hasPlaceholderTitle(group) {
+  return copiesOpeningAsk(group.title, group.anchorAsk?.text ?? null);
+}
+
+/** A written title as the ledger keeps it: 1–120 characters (applyGroupDecisions' title contract) that do not copy the
+ * request's opening ask, which would leave the request owed a title on every later run. */
+function writtenTitle(value, askText, label) {
+  const title = boundedText(value, 120, label);
+  if (copiesOpeningAsk(title, askText)) throw new TypeError(`${label} repeats the owner's ask ("${placeholderTitleFromAsk(askText)}"). Name the task in about 5 to 7 words of your own, not words the ask starts with.`);
+  return title;
+}
+
+/** title-input: one batch of requests still titled with the placeholder copied from their ask, in ledger order, each as
+ * the focus step reads it (its asks, and its review's state and summary when it has one), so a vague ask ("figure it
+ * out") is named from what the work turned out to be. `remaining` counts the requests left for later batches. */
+export function titleInput(ledger, database, { limit = TITLE_BATCH } = {}) {
+  const owed = Object.keys(ledger.groups.groups).filter((groupId) => hasPlaceholderTitle(ledger.groups.groups[groupId]));
+  return { requests: records(database, ledger, owed.slice(0, limit), focusRequestIndex(ledger)), remaining: Math.max(0, owed.length - limit) };
+}
+
+/** A naming answer checked against the batch it answers: every listed request named exactly once, by its groupId.
+ * With `coerce` (the refresh's one retry), a title this check refuses and a request left unnamed are dropped instead;
+ * such a request keeps its placeholder until a later run asks again. */
+export function validateTitleAnswer(answer, input, { coerce = false } = {}) {
+  if (!Array.isArray(answer?.titles)) throw new TypeError('The answer needs a titles array.');
+  const listed = new Map(input.requests.map((request) => [request.groupId, request]));
+  const named = new Map();
+  for (const [index, entry] of answer.titles.entries()) {
+    const label = `titles[${index}]`;
+    try {
+      if (!listed.has(entry?.groupId)) throw new TypeError(`${label} names ${JSON.stringify(entry?.groupId)}, which was not asked about.`);
+      if (named.has(entry.groupId)) throw new TypeError(`${label} names ${entry.groupId} a second time; give each request one title.`);
+      named.set(entry.groupId, writtenTitle(entry.title, listed.get(entry.groupId).firstAsk, `${label}.title`));
+    } catch (error) { if (!coerce || !(error instanceof TypeError)) throw error; }
+  }
+  const missing = [...listed.keys()].filter((groupId) => !named.has(groupId));
+  if (missing.length && !coerce) throw new TypeError(`Name every request asked about; missing ${missing.join(', ')}.`);
+  return { titles: [...named].map(([groupId, title]) => ({ groupId, title })) };
+}
+
 const requireDeviceId = (localDeviceId) => {
   if (typeof localDeviceId !== 'string') throw new TypeError('My Focus needs the worker\'s sync device id ("" when cloud sync never started).');
   return localDeviceId;
@@ -870,6 +974,8 @@ function option(args, name, fallback) {
 function openDatabase() {
   const path = process.env.CLAUDE_MEM_DB ?? join(DATA_DIR, 'claude-mem.db');
   statSync(path);
+  // Portable group reducers can run in Node. Load the native reader only for the local CLI.
+  const { Database } = createRequire(typeof __filename === 'string' ? __filename : import.meta.url)('bun:sqlite');
   const database = new Database(path, { readonly: true, create: false });
   database.exec('PRAGMA busy_timeout = 1500');
   return database;
@@ -891,6 +997,10 @@ export const GROUPING_BATCH = 20;
 /** Requests placed per focus answer: GROUPING_BATCH, the per-answer size the same light model (STEP_MODELS) already
  * decides "every listed item exactly once" for in grouping. Reused, not measured for placement itself. */
 export const FOCUS_BATCH = GROUPING_BATCH;
+/** Requests named per title answer, measured: on a copy of a real ledger (Nov 18) haiku, the light model (STEP_MODELS),
+ * named all 20 requests of a 20-request batch (a 55 KB title-input) in one answer, and validateTitleAnswer accepted
+ * every title. It is the size grouping and focus already ask that model to answer for, one item each. */
+export const TITLE_BATCH = GROUPING_BATCH;
 const CLOSED_STATES = new Set(['shipped', 'abandoned']);
 
 /** One grouping question: only conversations the ledger has not decided,
@@ -899,7 +1009,7 @@ const CLOSED_STATES = new Set(['shipped', 'abandoned']);
  * again, and neither are the keys in `skip` (conversations the judge could not
  * place in this run). `remaining` counts the new conversations left for later questions. */
 export function groupingInput(ledger, database, { sinceEpoch, limit = GROUPING_BATCH, skip = null }) {
-  const candidates = readCandidates(database, { sinceEpoch, excludedPromptIds: ledger.agentWrittenPromptIds });
+  const candidates = readCandidates(database, { sinceEpoch, recentAsks: true, excludedPromptIds: ledger.agentWrittenPromptIds });
   const decided = (key) => Boolean(ledger.groups.conversations[key] || ledger.groups.ignored?.[key] || skip?.has(key));
   const fresh = candidates.filter((candidate) => !decided(candidate.conversationKey));
   if (!fresh.length) return { root: null, conversations: [], openRequests: [], proposedLinks: [], remaining: 0 };
@@ -919,7 +1029,7 @@ export function groupingInput(ledger, database, { sinceEpoch, limit = GROUPING_B
     .filter(([groupId, group]) => groupRoot(group) === root && !CLOSED_STATES.has(ledger.progress[groupId]?.state))
     .map(([groupId, group]) => {
       const members = Object.entries(ledger.groups.conversations).filter(([, id]) => id === groupId).map(([key]) => byKey.get(key)).filter(Boolean);
-      const asks = members.flatMap((member) => member.asks).sort((a, b) => Date.parse(b.at) - Date.parse(a.at));
+      const asks = members.flatMap((member) => member.asks).sort((a, b) => Date.parse(b.at) - Date.parse(a.at) || b.promptId - a.promptId);
       return {
         groupId, title: group.title, anchor: group.anchor,
         anchorAsk: requestText(group.anchorAsk?.text ?? members[0]?.firstAsk ?? '', 400),
@@ -943,10 +1053,14 @@ export function groupingInput(ledger, database, { sinceEpoch, limit = GROUPING_B
 
 /** The grouping agent decides exactly the conversations it was sent: each
  * one joins an open request (listed after that request's anchor), starts a new
- * one, or is ignored. Nothing already decided may move. */
-export function validateGroupingAnswer(answer, input) {
+ * one, or is ignored. Nothing already decided may move.
+ * With `coerce` (the refresh's one retry, as in validateProgress), what this check and `apply` would refuse is cut
+ * from the answer instead, and each changed group or ignore entry is named in `coercedFields`. */
+export function validateGroupingAnswer(answer, input, options = {}) {
+  options = { coerce: false, coercedFields: new Set(), ...options };
   const asked = new Set(input.conversations.map((conversation) => conversation.conversationKey));
   const anchors = new Set(input.openRequests.map((request) => request.anchor));
+  if (options.coerce) answer = coerceGroupingAnswer(answer, asked, anchors, options);
   const decided = new Set();
   for (const [index, group] of (Array.isArray(answer?.groups) ? answer.groups : []).entries()) {
     for (const [position, key] of (Array.isArray(group?.conversations) ? group.conversations : []).entries()) {
@@ -962,6 +1076,36 @@ export function validateGroupingAnswer(answer, input) {
   const missing = [...asked].filter((key) => !decided.has(key));
   if (missing.length) throw new TypeError(`Decide every conversation asked about; missing ${missing.join(', ')}.`);
   return answer;
+}
+
+/** A grouping answer without its unsupported parts. A key outside the batch goes (an open request's anchor may only
+ * come first); a link keeps only its group's conversations and goes below two; a group is cut into the parts its links
+ * connect, so a conversation no link ties to the anchor starts its own request under the same title, and a part
+ * holding no asked conversation (an anchor left alone) goes; an ignore reason over 200 characters is shortened.
+ * Nothing is joined without a link, and no asked conversation is dropped. */
+function coerceGroupingAnswer(answer, asked, anchors, options) {
+  const groups = (Array.isArray(answer?.groups) ? answer.groups : []).flatMap((group, index) => {
+    if (!Array.isArray(group?.conversations)) return [group];
+    const members = group.conversations.filter((key, position) => asked.has(key) || (position === 0 && anchors.has(key)));
+    const links = (Array.isArray(group.links) ? group.links : [])
+      .map((link) => ({ ...link, conversations: (Array.isArray(link?.conversations) ? link.conversations : []).filter((key) => members.includes(key)) }))
+      .filter((link) => link.conversations.length >= 2);
+    // The same union of linked conversations applyGroupDecisions checks against the anchor.
+    const parent = new Map(members.map((key) => [key, key]));
+    const find = (key) => { while (parent.get(key) !== key) key = parent.get(key); return key; };
+    for (const link of links) for (const key of link.conversations.slice(1)) parent.set(find(key), find(link.conversations[0]));
+    const parts = new Map();
+    for (const key of members) parts.set(find(key), [...(parts.get(find(key)) ?? []), key]);
+    if (parts.size === 1 && JSON.stringify([members, links]) === JSON.stringify([group.conversations, group.links ?? []])) return [group];
+    options.coercedFields.add(`groups[${index}]`);
+    return [...parts.values()].filter((part) => part.some((key) => asked.has(key)))
+      .map((part) => ({ ...group, conversations: part, links: links.filter((link) => link.conversations.every((key) => part.includes(key))) }));
+  });
+  const ignored = (Array.isArray(answer?.ignored) ? answer.ignored : []).flatMap((entry, index) => {
+    if (!asked.has(entry?.conversation)) { options.coercedFields.add(`ignored[${index}]`); return []; }
+    return typeof entry.reason === 'string' && entry.reason.length > 200 ? [{ ...entry, reason: reviewText(entry.reason, 200, `ignored[${index}].reason`, options) }] : [entry];
+  });
+  return { ...answer, groups, ignored };
 }
 
 /** `apply` without the file: the decisions merged into `stored`, with every touched conversation's
@@ -1054,36 +1198,41 @@ export function runCli(argv, { dir = LEDGER_DIR, database = null, now = Date.now
   }
   if (command === 'record-progress') {
     const ledger = readLedger(dir);
-    const coercedFields = new Set();
-    const reviewed = validateProgress(readInput(args[0] ?? '-'), ledger.groups.groups, { coerce: coerceProgress, coercedFields });
+    const coercedFields = new Set(), droppedPreferences = new Set();
+    const reviewed = validateProgress(readInput(args[0] ?? '-'), ledger.groups.groups, { coerce: coerceProgress, coercedFields, droppedPreferences });
     const checkedAt = iso(now);
     const previous = ledger.progress[reviewed.groupId];
     // The story is retold only from reviews whose facts moved; reworded prose and review timestamps are not news.
     const unchanged = previous && JSON.stringify(storyFacts(previous)) === JSON.stringify(storyFacts(reviewed));
     const entry = { ...reviewed, checkedAt, changedAt: unchanged ? previous.changedAt ?? previous.checkedAt : checkedAt, readings: appendReading(ledger.progress[reviewed.groupId], { at: checkedAt, percent: reviewed.percent }) };
     writeJsonAtomic(join(dir, 'progress', `${entry.groupId}.json`), entry);
-    return print({ recorded: entry.groupId, state: entry.state, percent: entry.percent, readings: entry.readings.length, ...(coercedFields.size ? { coercedFields: [...coercedFields] } : {}) });
+    return print({ recorded: entry.groupId, state: entry.state, percent: entry.percent, readings: entry.readings.length, ...(coercedFields.size ? { coercedFields: [...coercedFields] } : {}),
+      ...(droppedPreferences.size ? { droppedPreferences: [...droppedPreferences] } : {}) });
+  }
+  if (command === 'title-input') return print(titleInput(readLedger(dir), db(), { limit: option(args, 'limit', TITLE_BATCH) }));
+  if (command === 'record-titles') {
+    const { groups } = readLedger(dir);
+    const answer = readInput(args[0] ?? '-');
+    if (!Array.isArray(answer?.titles)) throw new TypeError('The answer needs a titles array.');
+    let titled = 0;
+    // Every title is checked before the ledger is written. Only a placeholder is replaced: a title written meanwhile
+    // (a grouping answer, another device) stays.
+    for (const [index, entry] of answer.titles.entries()) {
+      const group = groups.groups[entry?.groupId];
+      if (!group) throw new TypeError(`titles[${index}] names unknown group ${entry?.groupId}.`);
+      const title = writtenTitle(entry.title, group.anchorAsk?.text ?? null, `titles[${index}].title`);
+      if (hasPlaceholderTitle(group)) { group.title = title; titled++; }
+    }
+    if (titled) { groups.updatedAt = iso(now); writeJsonAtomic(join(dir, 'request-groups.json'), groups); }
+    return print({ titled, kept: answer.titles.length - titled });
   }
   if (command === 'story-input') {
     const { groups, progress, story } = readLedger(dir);
     const reviews = Object.values(progress).sort((a, b) => String(a.startedAt).localeCompare(String(b.startedAt)));
     // With a previous story, only reviews whose facts changed after it was written.
     const writtenAt = Date.parse(story?.writtenAt ?? '');
-    const update = Number.isFinite(writtenAt);
-    // An update only ever added to the story until it reached the cap and every update was refused (Oct 24: 11,958 of 12,000),
-    // so the agent is told the budget and the previous story's length up front.
-    // With only the limit and length, an update at 11,836 of 12,000 still added ~1,300 characters and condensed nothing (Oct 24),
-    // so the room left is spelled out as well.
-    // With room counted up to the cap, updates still aimed at the cap and landed over it (Oct 24–26), so the room is
-    // counted up to the target, and a previous story past the target is first condensed back to it, part by part.
-    const previousNarrativeChars = story?.narrative?.length ?? 0;
-    return print({ groups: Object.keys(groups.groups).length, update, narrativeTarget: STORY_NARRATIVE_TARGET, narrativeLimit: STORY_NARRATIVE_MAX, previousNarrativeChars,
-      roomChars: Math.max(0, STORY_NARRATIVE_TARGET - previousNarrativeChars), condenseChars: Math.max(0, previousNarrativeChars - STORY_NARRATIVE_TARGET),
-      previousParts: update ? storyParts(story.narrative) : [], mergeOldestChapters: update ? storyChaptersToMerge(story.narrative) : 0,
-      reviews: update ? reviews.filter((review) => Date.parse(review.changedAt ?? review.checkedAt) > writtenAt) : reviews,
-      // Rules owner-goals put in the story are its own (record-story carries them over): shown here, the story model
-      // would echo them back without their source and when, leaving copies a later owner-goals save cannot replace.
-      previousStory: story && { ...story, preferences: (story.preferences ?? []).filter((preference) => preference?.source !== OWNER_GOALS_LIST) } });
+    return print(storyInput(Object.keys(groups.groups).length,
+      Number.isFinite(writtenAt) ? reviews.filter((review) => Date.parse(review.changedAt ?? review.checkedAt) > writtenAt) : reviews, story));
   }
   if (command === 'record-story') {
     const validated = validateStory(readInput(args[0] ?? '-'));
@@ -1111,5 +1260,5 @@ export function runCli(argv, { dir = LEDGER_DIR, database = null, now = Date.now
     return Promise.resolve(saveFocus(body)).then((saved) => print({ placed: saved.placed, proposed: saved.focusAreaIds.length, focusAreaIds: saved.focusAreaIds }));
   }
   if (command === 'refresh-needs') return print(refreshNeeds({ dir, database: db(), now, days: option(args, 'days', 14), localDeviceId }));
-  throw new TypeError('Usage: request-groups.mjs candidates|grouping-input|judge|apply|pending|show|record-progress|story-input|record-story|focus-input|record-focus|refresh-needs (see file header).');
+  throw new TypeError('Usage: request-groups.mjs candidates|grouping-input|judge|apply|pending|show|record-progress|title-input|record-titles|story-input|record-story|focus-input|record-focus|refresh-needs (see file header).');
 }

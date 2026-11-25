@@ -1,10 +1,10 @@
 /**
  * The job My Work's automatic refresh hands the agent runner: refresh the
- * owner's goals when they are stale, then group, review, sort into focus areas and retell
+ * owner's goals when they are stale, then group, review, name, sort into focus areas and retell
  * every request that is due. No day window beyond the skill's own default,
  * no group cap and no time limit (owner rule, Oct 22).
  *
- * Every backend (Claude Code, Codex, Gemini, and the selected API provider)
+ * Every backend (Claude Code, Codex, Gemini, OpenCode, and the selected API provider)
  * runs the same way: the worker runs the skills' CLI and scripts, asks the
  * read-only agent one JSON question per step or batch, and saves the answer through the
  * same validators the skills' CLI uses.
@@ -16,14 +16,16 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import type { AgentTask, AnswerSchema, AskAgent, StepModels, TaskAgentId } from '../agent-runner/run.js';
 import type { UsableAgentId } from '../agent-runner/detect.js';
-import { runCommand } from '../agent-runner/detect.js';
+import { cutOutputText, runCommand } from '../agent-runner/detect.js';
 import { writeOwnerPromptsFile, type OwnerPromptsFile } from '../prompt-import/owner-prompts-file.js';
 import { resolvePythonCommand } from './python.js';
+import { parseBoundedNumber } from '../../shared/bounded-setting.js';
+import { DEFAULT_API_AGENT_LIMITS, type ApiAgentLimits } from '../../shared/api-agent-limits.js';
 import { SettingsDefaultsManager, type SettingsDefaults } from '../../shared/SettingsDefaultsManager.js';
 import { logger } from '../../utils/logger.js';
-import { FOCUS_BATCH, readGoals, readLedger, runCli, validateFocusAnswer, validateGroupingAnswer, type FocusInput, type LedgerDatabase, type RefreshNeeds } from './request-groups.mjs';
+import { FOCUS_BATCH, readGoals, readLedger, runCli, storyInput as buildStoryInput, TITLE_BATCH, validateFocusAnswer, validateGroupingAnswer, validateStory, trimStoryPreferences, validateTitleAnswer, type FocusInput, type FocusRequestRecord, type LedgerDatabase, type RefreshNeeds } from './request-groups.mjs';
 import { FOCUS_AUTO_PLACE_THRESHOLD, judgeFocusBatch, placesAlone, type FocusJudge, type FocusJudgement } from './focus-judge.mjs';
-import { isWithdrawnArea, ownerGoalsAreaRows, ownerGoalsSaveKey, PROPOSAL_KINDS, readFocusAreas, type FocusArea, type RouterFocusBody } from './my-focus.mjs';
+import { isWithdrawnArea, ownerGoalsAreaRows, ownerGoalsSaveKey, PROPOSAL_KINDS, readFocusAreas, routerFocusRows, type FocusArea, type RouterFocusBody } from './my-focus.mjs';
 import { NAV_LABELS } from './nav-words.mjs';
 import { routeUndecided, type RequestJudge } from './request-judge.mjs';
 import { RUNTIME_SKILLS } from '../../shared/runtime-skills.js';
@@ -50,12 +52,12 @@ export function reviewConcurrency(dataDir: string): number {
     ?? parseInt(SettingsDefaultsManager.getAllDefaults().CLAUDE_MEM_MAX_CONCURRENT_AGENTS, 10);
 }
 
-/** The model each step runs on. Small, fast models match conversations and goals; stronger ones judge
- * progress, write the story and pick verbatim quotes. Codex's careful steps use its CLI default model.
- * Ids checked against claude --help (aliases), codex-cli 0.163.0 models_cache.json and gemini 0.49.0 aliases. */
+/** The model each step runs on. Small, fast models match conversations and goals and name requests from their
+ * reviews; stronger ones judge progress, write the story and pick verbatim quotes. Codex's careful steps use its CLI
+ * default model. Ids checked against claude --help (aliases), codex-cli 0.163.0 models_cache.json and gemini 0.49.0 aliases. */
 const LIGHT: StepModels = { 'claude-code': { model: 'haiku' }, codex: { model: 'gpt-6-luna', reasoningEffort: 'low' }, gemini: { model: 'flash-lite' } };
 const CAREFUL: StepModels = { 'claude-code': { model: 'sonnet' }, codex: {}, gemini: { model: 'flash' } };
-export const STEP_MODELS = { goals: CAREFUL, grouping: LIGHT, review: CAREFUL, focus: LIGHT, story: CAREFUL } as const;
+export const STEP_MODELS = { goals: CAREFUL, grouping: LIGHT, review: CAREFUL, titles: LIGHT, focus: LIGHT, story: CAREFUL } as const;
 type Step = keyof typeof STEP_MODELS;
 
 /** The setting that puts every step of one agent on a single model (#5164), e.g. `haiku` to keep the refresh
@@ -64,6 +66,7 @@ export const STEP_MODEL_SETTINGS = {
   'claude-code': 'CLAUDE_MEM_WORK_VIEW_CLAUDE_MODEL',
   codex: 'CLAUDE_MEM_WORK_VIEW_CODEX_MODEL',
   gemini: 'CLAUDE_MEM_WORK_VIEW_GEMINI_MODEL',
+  opencode: 'CLAUDE_MEM_WORK_VIEW_OPENCODE_MODEL',
   api: 'CLAUDE_MEM_WORK_VIEW_API_MODEL',
 } as const satisfies Record<TaskAgentId, keyof SettingsDefaults>;
 
@@ -84,9 +87,10 @@ export function resolveStepModels(dataDir: string): Record<Step, StepModels> {
 }
 
 /** The values CLAUDE_MEM_WORK_VIEW_AGENT accepts. The settings route validates against this same list. */
-export const WORK_VIEW_AGENT_CHOICES = ['', 'claude-code', 'codex', 'gemini', 'api', 'off', 'all'] as const;
+export const WORK_VIEW_AGENT_CHOICES = ['', 'claude-code', 'codex', 'gemini', 'opencode', 'api', 'off', 'all'] as const;
 
 export interface RefreshAgentChoice {
+  apiLimits?: ApiAgentLimits;
   /** The only agents the refresh may run on; absent means every logged-in agent. */
   allowedAgents?: TaskAgentId[];
   /** Tried first when it is logged in (#5435). */
@@ -95,7 +99,30 @@ export interface RefreshAgentChoice {
   stayOnFirstUsableAgent: boolean;
 }
 
-const LOCAL_AGENT_IDS: readonly UsableAgentId[] = ['claude-code', 'codex', 'gemini'];
+const LOCAL_AGENT_IDS: readonly UsableAgentId[] = ['claude-code', 'codex', 'gemini', 'opencode'];
+
+const warnedApiAgentLimits = new Set<string>();
+
+/** One limit setting, or its default. A set but invalid value warns once per value, naming the default used. */
+function apiAgentLimit(key: 'CLAUDE_MEM_WORK_VIEW_API_TIMEOUT_MS' | 'CLAUDE_MEM_WORK_VIEW_MAX_OUTPUT_TOKENS', raw: unknown, max: number, defaultValue: number): number {
+  const parsed = parseBoundedNumber(raw as string | number | undefined, { min: 1, max, integer: true });
+  if (parsed !== null) return parsed;
+  const text = typeof raw === 'number' ? String(raw) : typeof raw === 'string' ? raw.trim() : '';
+  if (text && !warnedApiAgentLimits.has(`${key}=${text}`)) {
+    warnedApiAgentLimits.add(`${key}=${text}`);
+    logger.warn('WORKER', `Invalid ${key}; the My Work API refresh uses the default`, { value: text, min: 1, max, default: defaultValue });
+  }
+  return defaultValue;
+}
+
+/** CLAUDE_MEM_WORK_VIEW_API_TIMEOUT_MS and CLAUDE_MEM_WORK_VIEW_MAX_OUTPUT_TOKENS, read at the start of every refresh. */
+function resolveApiAgentLimits(settings: SettingsDefaults): ApiAgentLimits {
+  return {
+    // Longer delays overflow a signed 32-bit runtime timer and can expire immediately.
+    timeoutMs: apiAgentLimit('CLAUDE_MEM_WORK_VIEW_API_TIMEOUT_MS', settings.CLAUDE_MEM_WORK_VIEW_API_TIMEOUT_MS, 2_147_483_647, DEFAULT_API_AGENT_LIMITS.timeoutMs),
+    maxOutputTokens: apiAgentLimit('CLAUDE_MEM_WORK_VIEW_MAX_OUTPUT_TOKENS', settings.CLAUDE_MEM_WORK_VIEW_MAX_OUTPUT_TOKENS, Number.MAX_SAFE_INTEGER, DEFAULT_API_AGENT_LIMITS.maxOutputTokens),
+  };
+}
 
 /** Which agents the My Work refresh may run on (#5189). A background refresh that falls through to another
  * agent spends that agent's quota without the owner asking: a Claude Code session limit sent ~230 hidden
@@ -108,22 +135,28 @@ const LOCAL_AGENT_IDS: readonly UsableAgentId[] = ['claude-code', 'codex', 'gemi
  *   ('openrouter', 'openai-compatible', 'cmem') runs the first logged-in agent in detect order, and only that one.
  *   The API provider itself runs the refresh only when the owner sets `api`: it spends that provider's credit.
  * The worker builds a fresh task for every run, so a settings change applies to the next refresh. */
-export function resolveRefreshAgents(dataDir: string): RefreshAgentChoice {
+export function resolveRefreshAgents(dataDir: string, setup = false): RefreshAgentChoice {
   const settings = SettingsDefaultsManager.loadFromFile(join(dataDir, 'settings.json'), true, { readOnly: true });
   const provider = String(settings.CLAUDE_MEM_PROVIDER ?? '').trim();
   const providerAgent: TaskAgentId | undefined = provider === 'claude' ? 'claude-code'
     : provider === 'codex' || provider === 'gemini' ? provider : undefined;
   const configuredAgent = String(settings.CLAUDE_MEM_WORK_VIEW_AGENT ?? '').trim();
   if (configuredAgent === 'off') return { allowedAgents: [], stayOnFirstUsableAgent: true };
-  if (configuredAgent === 'all') return { preferredAgent: providerAgent, stayOnFirstUsableAgent: false };
+  // `all` can fall through to the api agent too, so it gets the same limits as `api`.
+  if (configuredAgent === 'all') return { preferredAgent: providerAgent, stayOnFirstUsableAgent: false, apiLimits: resolveApiAgentLimits(settings) };
   const namedAgent = LOCAL_AGENT_IDS.find(agent => agent === configuredAgent);
   if (namedAgent) return { allowedAgents: [namedAgent], preferredAgent: namedAgent, stayOnFirstUsableAgent: true };
-  if (configuredAgent === 'api') return { allowedAgents: ['api'], preferredAgent: 'api', stayOnFirstUsableAgent: true };
+  if (configuredAgent === 'api') {
+    return { allowedAgents: ['api'], preferredAgent: 'api', stayOnFirstUsableAgent: true, apiLimits: resolveApiAgentLimits(settings) };
+  }
   if (configuredAgent) {
     logger.warn('WORKER', 'Unrecognized CLAUDE_MEM_WORK_VIEW_AGENT; the My Work refresh follows CLAUDE_MEM_PROVIDER instead', {
       value: configuredAgent, accepted: WORK_VIEW_AGENT_CHOICES.filter(Boolean).join(', '),
     });
   }
+  // Initial setup prefers the configured CLI. If it is absent, an already signed-in CLI can do the
+  // work. Once a usable CLI starts, stay on its account. A specifically chosen Work View agent above wins.
+  if (setup) return { preferredAgent: providerAgent, stayOnFirstUsableAgent: true };
   if (providerAgent) return { allowedAgents: [providerAgent], preferredAgent: providerAgent, stayOnFirstUsableAgent: true };
   return { stayOnFirstUsableAgent: true };
 }
@@ -166,6 +199,11 @@ export const GROUPING_ANSWER_SCHEMA: AnswerSchema = strictObject({
     links: { type: 'array', items: strictObject({ kind: { type: 'string', enum: ['shared-work-list', 'shared-request-id', 'agent-judgment'] }, conversations: stringArray, evidence: { type: 'string' } }) },
   }) },
   ignored: { type: 'array', items: strictObject({ conversation: { type: 'string' }, reason: { type: 'string' } }) },
+});
+
+/** The answer `record-titles` takes: one written title per request of the batch, by its groupId. */
+export const TITLE_ANSWER_SCHEMA: AnswerSchema = strictObject({
+  titles: { type: 'array', items: strictObject({ groupId: { type: 'string' }, title: { type: 'string' } }) },
 });
 
 /** The answer `record-focus` takes: every request placed by area id (or "other"), and areas proposed from Other.
@@ -345,14 +383,15 @@ export function buildRefreshTask(options: RefreshTaskOptions): AgentTask & { ste
     const stepModels = resolveStepModels(dataDir);
     const inlineEvidence = new Map<string, string>();
     // Count the files an agent must read when budgeting goals input, including tool-capable agents.
-    // Only Gemini and the API agent actually receive these contents inlined in the question below.
+    // Only Gemini, OpenCode and the API agent actually receive these contents inlined in the question below.
     if (needs.goalsStale) {
       for (const name of ['owner-prompts.md', 'new-owner-prompts.md']) {
         const path = join(goalsFolder, name);
         if (existsSync(path)) inlineEvidence.set(path, readFileSync(path, 'utf8'));
       }
     }
-    let questionByteLimit: number | null = null;
+    /** The byte budget the next question must fit, and the refusal that names its step when it does not. */
+    let questionBudget: { bytes: number; refusal: string } | null = null;
     const expandedQuestion = (prompt: string): string => {
       const supplied = [...inlineEvidence].filter(([path]) => prompt.includes(path));
       return supplied.length ? prompt + '\n\nThe following input files are supplied inline; no file tools are available:\n'
@@ -360,10 +399,8 @@ export function buildRefreshTask(options: RefreshTaskOptions): AgentTask & { ste
     };
     const ask: AskAgent = (prompt, models, schema) => {
       const expanded = expandedQuestion(prompt);
-      if (questionByteLimit !== null && Buffer.byteLength(expanded, 'utf8') > questionByteLimit) {
-        throw batchFailure('This owner-goals question exceeds the input budget, including its checked draft or refused answer. Progress is retained; no prompt was skipped.');
-      }
-      return askBackend(agent === 'gemini' || agent === 'api' ? expanded : prompt, models, schema);
+      if (questionBudget && Buffer.byteLength(expanded, 'utf8') > questionBudget.bytes) throw batchFailure(questionBudget.refusal);
+      return askBackend(agent === 'gemini' || agent === 'opencode' || agent === 'api' ? expanded : prompt, models, schema);
     };
     const writeInput = (name: string, value: unknown) => {
       const path = join(runDir, `${++fileNumber}-${name}.json`);
@@ -373,7 +410,7 @@ export function buildRefreshTask(options: RefreshTaskOptions): AgentTask & { ste
       return path;
     };
     const localDeviceId = options.localDeviceId();
-    const cli = (argv: string[], input?: unknown, cliOptions: { coerceProgress?: boolean } = {}) => {
+    const cli = (argv: string[], input?: unknown, cliOptions: { coerceProgress?: boolean; now?: number } = {}) => {
       let output: any;
       const database = openDatabase();
       try { runCli(input === undefined ? argv : [...argv, writeInput(argv[0], input)], { dir: ledgerDir, database, now: now(), print: value => { output = value; }, localDeviceId, ...cliOptions }); }
@@ -397,6 +434,26 @@ export function buildRefreshTask(options: RefreshTaskOptions): AgentTask & { ste
       } finally { database.close(); }
       return output as { placed: number; proposed: number };
     };
+    let droppedProposals = 0;
+    /** For the focus step's retry: the answer without each proposal that record-focus's check or the worker's write
+     * refuses. A proposal is a suggestion the owner still decides, so a bad one no longer fails the placements beside it.
+     * Refused placements are left for record-focus to refuse. */
+    const withoutRefusedProposals = (answer: any, input: Parameters<typeof validateFocusAnswer>[1], flags: { other?: boolean } = {}) => {
+      const ledger = readLedger(ledgerDir);
+      const database = openDatabase();
+      let focusAreas: FocusArea[];
+      try { focusAreas = readFocusAreas(database, { localDeviceId }); } finally { database.close(); }
+      // The worker's pure preflight (WorkViewRoutes.recordRouterFocus) after record-focus's check, as the goals step reuses
+      // ownerGoalsAreaRows: a name reusing a nav label, or a row too long to save, fails only there. Nothing is written.
+      const accepted = (candidate: any) => {
+        try { routerFocusRows(validateFocusAnswer(candidate, input, ledger, flags), focusAreas); return true; }
+        catch (error) { if (error instanceof TypeError || error instanceof RangeError) return false; throw error; }
+      };
+      if (!Array.isArray(answer?.proposals) || !accepted({ ...answer, proposals: [] })) return answer;
+      const proposals = answer.proposals.reduce((kept: unknown[], proposal: unknown) => accepted({ ...answer, proposals: [...kept, proposal] }) ? [...kept, proposal] : kept, []);
+      droppedProposals += answer.proposals.length - proposals.length;
+      return { ...answer, proposals };
+    };
     let python: ReturnType<typeof resolvePythonCommand> | undefined;
     /** Resolve once per refresh, and never retry the script with another interpreter. The goals step re-asks the model
      * after a refusal, which save_goals.py gives before it writes anything (exit 1); a failure after it started writing
@@ -410,6 +467,9 @@ export function buildRefreshTask(options: RefreshTaskOptions): AgentTask & { ste
         throw Object.assign(new Error(`${args[0].split('/').pop()} exited ${result.exitCode}: ${`${result.stdout}\n${result.stderr}`.trim().slice(-800)}`),
           { retryable: result.exitCode !== SAVE_GOALS_FAILED_AFTER_WRITING_EXIT });
       }
+      // The script finished, so it has written what it writes; its cut report cannot be parsed, and asking again would
+      // write a second answer.
+      if (result.stdoutTruncated) throw Object.assign(new Error(cutOutputText(args[0].split('/').pop()!)), { retryable: false });
       return result.stdout;
     };
     const timed = async <T>(name: string, work: () => Promise<T>, extra: { groups?: number } = {}): Promise<T> => {
@@ -418,7 +478,7 @@ export function buildRefreshTask(options: RefreshTaskOptions): AgentTask & { ste
       finally { steps.push({ step: name, agent, startedAt, finishedAt: new Date(now()).toISOString(), ...extra }); }
     };
     /**
-     * The owner's language for this run is named in every step's question: grouping, review, focus, story and goals.
+     * The owner's language for this run is named in every step's question: grouping, review, naming, focus, story and goals.
      * Those run as separate agents that each see only their own input (a review batch in "amend" mode sees only its
      * later asks; a goals batch in an initial mapping sees only its slice of the prompts, and a goals-only run has no
      * grouping at all), so left to the skill's rule they could each pick a different language (#5660, #6185). It is
@@ -439,18 +499,19 @@ export function buildRefreshTask(options: RefreshTaskOptions): AgentTask & { ste
       textLanguage = decided;
       writeFileSync(join(ledgerDir, DECIDED_LANGUAGE_FILE), JSON.stringify({ language: decided, decidedAt: new Date(now()).toISOString() }, null, 2), { mode: 0o600 });
     };
-    const step = <T>(name: Step, question: string, save: (answer: any) => T | Promise<T>, answerSchema?: AnswerSchema): Promise<T> => {
+    const step = <T>(name: Step, question: string, save: (answer: any, retry: boolean) => T | Promise<T>, answerSchema?: AnswerSchema): Promise<T> => {
       const rule = languageRule();
       return timed(name, () => askAndSave(name, rule ? `${question}\n\n${rule}` : question, save, answerSchema));
     };
     /** Ask, save, and on a refusal (unreadable JSON or a validator's) ask once more with the answer and reason.
-     * A step refused twice fails with its last raw answer kept in failed-answers/ for diagnosis. */
-    const askAndSave = async <T>(name: Step, question: string, save: (answer: any) => T | Promise<T>, answerSchema?: AnswerSchema): Promise<T> => {
+     * A step refused twice fails with its last raw answer kept in failed-answers/ for diagnosis. `retry` tells the save
+     * it holds that second answer. */
+    const askAndSave = async <T>(name: Step, question: string, save: (answer: any, retry: boolean) => T | Promise<T>, answerSchema?: AnswerSchema): Promise<T> => {
       let refusal: string | null = null;
       let answer = '';
       for (let attempt = 0; attempt < 2; attempt++) {
         answer = await ask(refusal ? `${question}\n\nYour previous answer was refused: ${refusal}\nRejected answer:\n${answer}\n\nFix it and answer again.` : question, stepModels[name], answerSchema);
-        try { return await save(parseAgentJson(answer)); }
+        try { return await save(parseAgentJson(answer), attempt > 0); }
         catch (error) {
           // A save that failed after it started writing is not the answer's fault, and asking again would write twice.
           if ((error as { retryable?: boolean })?.retryable === false) throw error;
@@ -559,7 +620,7 @@ export function buildRefreshTask(options: RefreshTaskOptions): AgentTask & { ste
               const contents = renderOwnerGoalsBatch(batch);
               writeFileSync(batchPath, contents, { mode: 0o600 });
               inlineEvidence.set(batchPath, contents);
-              questionByteLimit = OWNER_GOALS_QUESTION_BYTES;
+              questionBudget = { bytes: OWNER_GOALS_QUESTION_BYTES, refusal: 'This owner-goals question exceeds the input budget, including its checked draft or refused answer. Progress is retained; no prompt was skipped.' };
               try {
                 await step('goals', question, async answer => {
                   if (typeof answer.map !== 'string' || !(answer.goals === null || (answer.goals && typeof answer.goals === 'object' && !Array.isArray(answer.goals)))) {
@@ -579,7 +640,7 @@ export function buildRefreshTask(options: RefreshTaskOptions): AgentTask & { ste
                   goalsCheckpoint = next;
                   for (const section of batch) processed.add(section.key);
                 });
-              } finally { questionByteLimit = null; }
+              } finally { questionBudget = null; }
             }
             if (!checked && !ownerPrompts) checked = await validate({ generated_at: exportedAt, window_days: 31,
               human_summary: 'No owner prompts in this window.', focus_areas: [], asks: [], rules: [] });
@@ -678,7 +739,7 @@ export function buildRefreshTask(options: RefreshTaskOptions): AgentTask & { ste
       // Only conversations the ledger has not decided, one project root per question, each beside
       // that root's open requests. Every batch is saved before the next is read, so a later batch
       // sees the requests an earlier one started.
-      let grouped = 0;
+      let grouped = 0, repairedDecisions = 0;
       for (let input = cli(['grouping-input', '--days', '14']); input.conversations.length; input = cli(['grouping-input', '--days', '14'])) {
         await step('grouping', [
           requestProgress, '---', readOnly,
@@ -686,19 +747,23 @@ export function buildRefreshTask(options: RefreshTaskOptions): AgentTask & { ste
           // answered {"groups": [], "ignored": []} without reading it (Oct 23, twice in a row).
           `Do only section 1 (grouping) for this one batch of new conversations, the \`grouping-input\` output (also saved in ${writeInput('grouping-input', input)}):\n\n\`\`\`json\n${JSON.stringify(input, null, 2)}\n\`\`\``,
           `Decide each of these ${input.conversations.length} conversations exactly once, in "groups" or "ignored": ${input.conversations.map((conversation: { conversationKey: string }) => conversation.conversationKey).join(', ')}. Reply with only the decisions JSON that \`apply\` takes ({"groups": [...], "ignored": [...]}), deciding every conversation in the batch and nothing else, plus "language": the human language most of the owner's asks are written in, as an English name such as "English", ignoring code, file paths, URLs and product names.`,
-        ].join('\n\n'), answer => {
+        ].join('\n\n'), (answer, retry) => {
           const { language, ...decisions } = answer ?? {};
-          const saved = cli(['apply'], validateGroupingAnswer(decisions, input));
+          // The first answer is held strictly, so the model can link its join itself. A retry that still names keys outside
+          // the batch or joins without links saves the parts its links support, instead of failing the whole run.
+          const repaired = new Set<string>();
+          const saved = cli(['apply'], validateGroupingAnswer(decisions, input, { coerce: retry, coercedFields: repaired }));
+          repairedDecisions += repaired.size;
           noteGroupingLanguage(language);
           return saved;
         }, GROUPING_ANSWER_SCHEMA);
         grouped += input.conversations.length;
       }
-      if (grouped) done.push(`${grouped} new conversations grouped`);
+      if (grouped) done.push(`${grouped} new conversations grouped${repairedDecisions ? ` (${repairedDecisions} decisions repaired after retry)` : ''}`);
 
       const due: Array<{ groupId: string }> = cli(['pending', '--days', '14', '--limit', '1000000']).groups;
       let reviewed = 0;
-      const coercedReviewFields = new Set<string>();
+      const coercedReviewFields = new Set<string>(), droppedPreferences = new Set<string>();
       /** One batch of reviews. Like step(), but a refusal re-asks only for the groups that were refused. */
       const reviewBatch = async (groups: Array<{ groupId: string }>, rule: string) => {
         let shows = groups.map(group => cli(['show', group.groupId]));
@@ -724,6 +789,7 @@ export function buildRefreshTask(options: RefreshTaskOptions): AgentTask & { ste
               // still exceeds a review cap on its one retry, bound generated fields and save the partial review.
               const saved = cli(['record-progress'], review, { coerceProgress: attempt > 0 && retryGroupIds.has(String(review.groupId)) });
               for (const field of saved?.coercedFields ?? []) coercedReviewFields.add(`${review.groupId}:${field}`);
+              for (const label of saved?.droppedPreferences ?? []) droppedPreferences.add(`${review.groupId}:${label}`);
               recorded.add(String(review.groupId)); reviewed++;
             }
             catch (error) { rejectedReviews.push(review); refusals.push(`${review.groupId}: ${error instanceof Error ? error.message : String(error)}`); }
@@ -749,7 +815,34 @@ export function buildRefreshTask(options: RefreshTaskOptions): AgentTask & { ste
       await Promise.all(Array.from({ length: Math.min(reviewConcurrency(dataDir), batches.length) }, lane));
       const failed = outcomes.filter(outcome => outcome.status === 'rejected');
       if (failed.length) throw (failed[0] as PromiseRejectedResult).reason;
-      if (reviewed) done.push(`${reviewed} requests reviewed${coercedReviewFields.size ? ` (${coercedReviewFields.size} oversized fields trimmed after retry)` : ''}`);
+      const reviewRepairs = [...(coercedReviewFields.size ? [`${coercedReviewFields.size} oversized fields trimmed after retry`] : []),
+        ...(droppedPreferences.size ? [`${droppedPreferences.size} preferences without a quote or text dropped after retry`] : [])];
+      if (reviewed) done.push(`${reviewed} requests reviewed${reviewRepairs.length ? ` (${reviewRepairs.join(', ')})` : ''}`);
+
+      // Names: a request the judge started (or whose title a grouping answer copied) still shows its opening ask word for
+      // word as its title. After the reviews, so a vague ask ("figure it out") is named from what its review found; before
+      // focus, so a new request is placed while it shows its written title (a request named after it was placed keeps its
+      // placement: focusDue). Every owed title is read once (no group cap, as for the reviews: the owner rule at the top of
+      // this file) and asked batch by batch, so a request whose title is refused twice keeps its placeholder until the next
+      // run instead of being asked again here. Focus and the story do not depend on the names, so a failed naming step is
+      // reported after they have run.
+      let namingError: unknown = null;
+      try {
+        const owedTitles: FocusRequestRecord[] = cli(['title-input', '--limit', '1000000']).requests;
+        let named = 0, unnamed = 0;
+        for (let index = 0; index < owedTitles.length; index += TITLE_BATCH) {
+          const input = { requests: owedTitles.slice(index, index + TITLE_BATCH) };
+          const saved = await step('titles', [
+            requestProgress, '---', readOnly,
+            // Inline with every groupId named, like grouping and focus.
+            `Do only section 3 (name each request) for this batch of \`title-input\` requests (also saved in ${writeInput('title-input', input)}):\n\n\`\`\`json\n${JSON.stringify(input, null, 2)}\n\`\`\``,
+            `Write one title for each of these ${input.requests.length} requests, by its "groupId": ${input.requests.map(request => request.groupId).join(', ')}. Reply with only the JSON that \`record-titles\` takes ({"titles": [{"groupId": "...", "title": "..."}]}).`,
+          ].join('\n\n'), (answer, retry) => cli(['record-titles'], validateTitleAnswer(answer, input, { coerce: retry })), TITLE_ANSWER_SCHEMA);
+          named += saved.titled;
+          unnamed += input.requests.length - saved.titled - saved.kept;
+        }
+        if (named || unnamed) done.push(`${named} requests named${unnamed ? ` (${unnamed} still titled with their ask until the next refresh)` : ''}`);
+      } catch (error) { namingError = error; }
 
       // Focus: place the requests not placed yet (changed since, or whose area is gone) in batches, each saved before the
       // next is read, then propose areas from Other when the router-placed Other requests changed since the last pass.
@@ -799,9 +892,9 @@ export function buildRefreshTask(options: RefreshTaskOptions): AgentTask & { ste
           if (anchors.join('\n') === previousBatch) throw new Error(`focus: the placed requests are still queued (${anchors.length} starting ${anchors[0]}).`);
           previousBatch = anchors.join('\n');
           const saved = await step('focus', sorting([
-            `Do only section 3, steps 1–2 (place each request in a focus area, promoting one that holds several separate asks) for this batch, the \`focus-input\` output (also saved in ${writeInput('focus-input', input)}):\n\n\`\`\`json\n${JSON.stringify(input, null, 2)}\n\`\`\``,
+            `Do only section 4, steps 1–2 (place each request in a focus area, promoting one that holds several separate asks) for this batch, the \`focus-input\` output (also saved in ${writeInput('focus-input', input)}):\n\n\`\`\`json\n${JSON.stringify(input, null, 2)}\n\`\`\``,
             `Place each of these ${anchors.length} requests exactly once, by its "anchor": ${anchors.join(', ')}. Reply with only the JSON that \`record-focus\` takes ({"placements": [...], "proposals": [...]}).`,
-          ].join('\n\n')), answer => recordFocus(['--limit', String(FOCUS_BATCH)], answer), FOCUS_ANSWER_SCHEMA);
+          ].join('\n\n')), (answer, retry) => recordFocus(['--limit', String(FOCUS_BATCH)], retry ? withoutRefusedProposals(answer, input) : answer), FOCUS_ANSWER_SCHEMA);
           placed += saved.placed; proposed += saved.proposed;
         }
         if (judged.size) {
@@ -812,23 +905,96 @@ export function buildRefreshTask(options: RefreshTaskOptions): AgentTask & { ste
         const other = cli(['focus-input', '--other']);
         if (other.due) {
           const saved = await step('focus', sorting(
-            `Do only section 3, step 3 (propose focus areas from Other) for the \`focus-input --other\` output (also saved in ${writeInput('focus-input-other', other)}):\n\n\`\`\`json\n${JSON.stringify(other, null, 2)}\n\`\`\`\n\nPlace nothing ("placements": []). Reply with only the JSON that \`record-focus --other\` takes ({"placements": [], "proposals": [...]}), proposing nothing when nothing qualifies.`,
-          ), answer => recordFocus(['--other'], answer), FOCUS_ANSWER_SCHEMA);
+            `Do only section 4, step 3 (propose focus areas from Other) for the \`focus-input --other\` output (also saved in ${writeInput('focus-input-other', other)}):\n\n\`\`\`json\n${JSON.stringify(other, null, 2)}\n\`\`\`\n\nPlace nothing ("placements": []). Reply with only the JSON that \`record-focus --other\` takes ({"placements": [], "proposals": [...]}), proposing nothing when nothing qualifies.`,
+          ), (answer, retry) => recordFocus(['--other'], retry ? withoutRefusedProposals(answer, other, { other: true }) : answer), FOCUS_ANSWER_SCHEMA);
           proposed += saved.proposed;
         }
-        if (placed || proposed) done.push([...(placed ? [`${placed} requests placed`] : []), ...(proposed ? [`${proposed} focus areas suggested`] : [])].join(', '));
+        if (placed || proposed || droppedProposals) done.push([...(placed ? [`${placed} requests placed`] : []), ...(proposed ? [`${proposed} focus areas suggested`] : []),
+          ...(droppedProposals ? [`${droppedProposals} refused focus area proposals dropped after retry`] : [])].join(', '));
       } catch (error) { focusError = error; }
 
       // Only reviews whose facts (state, percent, dates, milestones, preferences, outcome) moved since the last story; none means the story still holds.
+      // A story written in parts takes several calls, so a review can move while it is being written. The story is
+      // recorded as of this read, so a review that moves after it still counts as news for the next refresh.
+      const storyReadAt = now();
       const storyInput = cli(['story-input']);
       if (storyInput.reviews.length) {
-        await step('story', [
+        // One question held every moved review with no cap, so once enough reviews piled up the question
+        // outgrew the model's window and every later refresh failed the same way (#6226). The reviews are
+        // packed into parts under the complete-question budget the owner-goals map uses
+        // (OWNER_GOALS_QUESTION_BYTES, from the #5969 measurements), each part sized against the question
+        // as it will actually be asked: step() appends the run's language line, and the story so far rides
+        // along in every later part's input. The first part writes (or updates) the story and each later
+        // part updates the story the part before returned. Only the last part is recorded: record-story
+        // stamps the story's writtenAt, so recording an early part would mark the reviews still to come
+        // as already told, and no later refresh would send them again. A part that fails records nothing,
+        // so the next refresh tells the whole story again rather than losing the reviews it missed.
+        const batchPath = writeInput('story-input', '');
+        const storyQuestion = (input: any) => [
           requestProgress, '---', readOnly,
-          `Do only section 4 (${storyInput.update ? 'update' : 'write'} the build story). The \`story-input\` output is in ${writeInput('story-input', storyInput)}. Reply with only the JSON that \`record-story\` takes ({"narrative": "...", "preferences": [...]}).`,
-        ].join('\n\n'), answer => cli(['record-story'], answer));
-        done.push(storyInput.update ? 'story updated' : 'story written');
+          `Do only section 5 (${input.update ? 'update' : 'write'} the build story). The \`story-input\` output is in ${batchPath}. Reply with only the JSON that \`record-story\` takes ({"narrative": "...", "preferences": [...]}).`,
+        ].join('\n\n');
+        // The first part answers story-input as read; each later part updates the story the part before returned,
+        // shaped as story-input reads a recorded one back.
+        const storyInputFor = (reviews: any[], previous: { narrative: string; preferences: any[] } | null) => previous === null
+          ? { ...storyInput, reviews }
+          : buildStoryInput(storyInput.groups, reviews, { ...previous, writtenAt: new Date(storyReadAt).toISOString() });
+        /** Write the part's input file and measure the question exactly as step() will ask it. */
+        const storyQuestionBytes = (input: any) => {
+          const contents = JSON.stringify(input, null, 2);
+          writeFileSync(batchPath, contents, { mode: 0o600 });
+          inlineEvidence.set(batchPath, contents);
+          const question = storyQuestion(input);
+          const rule = languageRule();
+          return Buffer.byteLength(expandedQuestion(rule ? `${question}\n\n${rule}` : question), 'utf8');
+        };
+        const packStoryBatch = (remaining: any[], previous: { narrative: string; preferences: any[] } | null) => {
+          const available = Math.min(OWNER_GOALS_BATCH_BYTES, OWNER_GOALS_QUESTION_BYTES - storyQuestionBytes(storyInputFor([], previous)));
+          const batch: any[] = [];
+          let used = 0;
+          for (const review of remaining) {
+            // A review's cost in the pretty-printed input: its own JSON, four more spaces of indent on
+            // every line, and the comma and newline that separate it from the review before it.
+            const cost = Buffer.byteLength(JSON.stringify(review, null, 2).replaceAll('\n', '\n    '), 'utf8') + 4 + (batch.length ? 2 : 0);
+            if (used + cost > available) break;
+            batch.push(review);
+            used += cost;
+          }
+          // The packing estimates each review's bytes; the written batch is measured exactly, and reviews
+          // move to the next part until the question fits the budget.
+          while (batch.length > 1 && storyQuestionBytes(storyInputFor(batch, previous)) > OWNER_GOALS_QUESTION_BYTES) batch.pop();
+          if (!batch.length || storyQuestionBytes(storyInputFor(batch, previous)) > OWNER_GOALS_QUESTION_BYTES) {
+            throw batchFailure('One moved review and the story question around it exceed the input budget, so the story cannot be written in parts. No review was skipped.');
+          }
+          return batch;
+        };
+        let previous: { narrative: string; preferences: any[] } | null = null;
+        let remaining = storyInput.reviews as any[];
+        let parts = 0, storyPreferencesTrimmed = 0;
+        while (remaining.length) {
+          const batch = packStoryBatch(remaining, previous);
+          remaining = remaining.slice(batch.length);
+          const input = storyInputFor(batch, previous);
+          storyQuestionBytes(input);
+          const last = !remaining.length;
+          questionBudget = { bytes: OWNER_GOALS_QUESTION_BYTES, refusal: 'This story question exceeds the input budget, including its refused answer. Nothing was recorded; no review was skipped.' };
+          try {
+            await step('story', storyQuestion(input), async (answer, retry) => {
+              const trimmed = new Set<string>();
+              if (retry) answer = trimStoryPreferences(answer, trimmed);
+              const saved = last ? cli(['record-story'], answer, { now: storyReadAt }) : (previous = validateStory(answer));
+              storyPreferencesTrimmed += trimmed.size;
+              return saved;
+            });
+          } finally { questionBudget = null; }
+          parts++;
+        }
+        done.push(`${storyInput.update ? 'story updated' : 'story written'}${parts > 1 ? ` in ${parts} parts` : ''}${storyPreferencesTrimmed ? ` (${storyPreferencesTrimmed} story preferences trimmed after retry)` : ''}`);
       }
-      if (focusError) throw focusError;
+      // Held so focus and the story still ran. When both failed, the run's error names both.
+      const heldFailures = [namingError, focusError].filter(error => error != null);
+      if (heldFailures.length > 1) throw new AggregateError(heldFailures, heldFailures.map(error => error instanceof Error ? error.message : String(error)).join(' · '));
+      if (heldFailures.length) throw heldFailures[0];
       return done.length ? `${done.join(', ')}.` : 'Nothing was due.';
     } catch (error) {
       if (!answerWasRefused) throw error;
@@ -842,7 +1008,7 @@ export function buildRefreshTask(options: RefreshTaskOptions): AgentTask & { ste
     reason,
     steps,
     // The refresh runs on the agent the owner's settings name, and stays there (#5189, #5435).
-    ...resolveRefreshAgents(dataDir),
+    ...resolveRefreshAgents(dataDir, reason === 'setup-scan'),
     // The work-view folder holds every input file; the data dir above it holds .env and settings.json.
     cwd: ledgerDir,
     claudeCode: {

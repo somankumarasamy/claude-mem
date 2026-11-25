@@ -16,7 +16,7 @@ import { pathToFileURL } from 'url';
 import type { Database } from 'bun:sqlite';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
-import { buildWorkerUrl, getWorkerPort, getWorkerHost, fetchWithTimeout, resolvePluginRoot, resolveWorkerScriptPath } from '../shared/worker-utils.js';
+import { buildWorkerUrl, getWorkerPort, getWorkerHost, fetchWithTimeout, isWorkerScriptOutsideRoot, workerHttpRequest, resolvePluginRoot, resolveWorkerScriptPath } from '../shared/worker-utils.js';
 import { InvalidWorkerUrlError, normalizeWorkerBaseUrl } from '../shared/worker-url.js';
 import { getCurrentWorkerPid, verifyRestartedWorker } from './restart-verify.js';
 import { runShutdownSequence, WORKER_GRACEFUL_SHUTDOWN_DEADLINE_BASE_MS, type WorkerShutdownReason } from './worker-shutdown.js';
@@ -36,6 +36,7 @@ import { HOOK_TIMEOUTS } from '../shared/hook-constants.js';
 import { getUptimeSeconds } from '../shared/uptime.js';
 import { SettingsDefaultsManager } from '../shared/SettingsDefaultsManager.js';
 import { readLocalApiToken } from '../shared/hook-settings.js';
+import { readLegacyTvToken, resolveWorkerBindHost, warnOnPlainHttpRemoteTokenHost } from './worker/worker-bind-host.js';
 import { describeObserverAuthMethod } from './worker/observer-auth-method.js';
 import { logger } from '../utils/logger.js';
 import { isHookStdoutClosed } from '../shared/hook-io.js';
@@ -335,8 +336,8 @@ export class WorkerService implements WorkerRef {
   // the previous run's stale PID file + the clean-shutdown sentinel.
   private previousShutdown: 'clean' | 'crash' | 'unknown' = 'unknown';
   private previousUptimeSeconds: number | null = null;
-  // Observation TV shared secret, resolved once in the constructor. Empty = off.
-  private tvToken: string = '';
+  // Whether the local API token guard is mounted, resolved once in the constructor.
+  private localApiTokenEnabled: boolean = false;
   private mcpClient: Client;
 
   private mcpReady: boolean = false;
@@ -445,20 +446,11 @@ export class WorkerService implements WorkerRef {
       version: packageVersion
     }, { capabilities: {} });
 
-    // Observation TV remote broadcast secret. Must be read from settings.json —
-    // SettingsDefaultsManager.get() only consults process.env and DEFAULTS, so a
-    // token written to ~/.claude-mem/settings.json would be invisible to it.
-    // Whitespace-only is OFF, not a secret equal to a space.
-    // RESOLUTION POINT: the token is the single switch. It is passed to the
-    // Server below as `remoteReadOnly`, and only when it is non-empty — so a
-    // token-less install constructs an options object identical to today's and
-    // the read-only guard is never mounted.
     const workerSettings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
-    const tvToken = (workerSettings.CLAUDE_MEM_TV_TOKEN ?? '').trim();
-    this.tvToken = tvToken;
     // Local API token (#5141): file-only, so the environment cannot switch the mode.
     // Read once at boot; restart to change.
     const localApiToken = readLocalApiToken();
+    this.localApiTokenEnabled = localApiToken !== '';
 
     this.server = new Server({
       getInitializationComplete: () => this.initializationCompleteFlag,
@@ -488,7 +480,6 @@ export class WorkerService implements WorkerRef {
       preBodyParserRoutes: [
         new BetterAuthRoutes(() => this.dbManager.getConnection()),
       ],
-      ...(tvToken ? { remoteReadOnly: { getToken: () => tvToken } } : {}),
       ...(localApiToken ? { localApiToken: { getToken: () => localApiToken, openStaticPaths: uiStaticPaths() } } : {}),
       // Browser access: same-host and CLAUDE_MEM_ALLOWED_ORIGINS for CORS, plus
       // the DNS-rebinding Host check. Read once at boot; restart to change it.
@@ -496,6 +487,8 @@ export class WorkerService implements WorkerRef {
     });
 
     this.registerRoutes();
+    // The terminal 404 and error handlers are installed by initializeBackground(),
+    // after the routes it registers late (search, Work View, sync, backups).
 
     this.registerSignalHandlers();
   }
@@ -683,8 +676,29 @@ export class WorkerService implements WorkerRef {
         runningScriptPath: __dirname,
         additionalProtectedVersions: [packageVersion],
       }).then(result => {
-        if (result.removed.length > 0) {
-          logger.info('SYSTEM', `Pruned ${result.removed.length} stale plugin cache version(s)`, { removed: result.removed });
+        // One info line per removed folder: who pruned it (this worker's PID
+        // and version), what it protected, the plan's reason and the
+        // `.in_use` verdicts that failed to keep it. A removal that costs a
+        // live session its hooks must be attributable from the log alone
+        // (#6349).
+        const sweeper = { source: 'worker-sweep', workerPid: process.pid, workerVersion: packageVersion };
+        for (const version of result.removed) {
+          logger.info('SYSTEM', `Pruned stale plugin cache version ${version}`, {
+            ...sweeper,
+            version,
+            reason: result.pruneReasons[version],
+            rejectedHostRecords: result.rejectedHostRecords.filter(record => record.version === version),
+            ...result.protection,
+          });
+        }
+        // The process-name override keeps a folder that a start-time mismatch
+        // would have condemned. Log each, so the override never hides the
+        // evidence of a mismatch (#6349).
+        for (const record of result.keptByProcessNameOverride) {
+          logger.info('SYSTEM', `Kept plugin cache version ${record.version}: its recorded process is still a Claude process though its start time differs`, {
+            ...sweeper,
+            ...record,
+          });
         }
         for (const failure of result.failed) {
           logger.warn('SYSTEM', `Could not prune plugin cache version ${failure.version}`, { reason: failure.reason });
@@ -832,7 +846,7 @@ export class WorkerService implements WorkerRef {
     if (this.corpusRoutes == null) {
       throw new Error('The corpus routes are not registered (background initialization has not reached them, or failed before it did), so a corpus build cannot be read');
     }
-    const running: string[] = [...this.workViewRoutes.backgroundWorkRunning({ countScanWaitingForUploadAnswer: false })];
+    const running: string[] = [...this.workViewRoutes.backgroundWorkRunning({ countScanWaitingForUploadAnswer: false, failOnUnreadableRefresh: true })];
     if (this.workViewRoutes.cardWordingRequestsRunning() > 0) running.push('my-work-card-wording');
     if (this.corpusRoutes.corpusBuildsRunning() > 0) running.push('corpus-build');
     if (this.sessionManager.getSessionWrapupsInFlight() > 0) running.push('telegram-session-wrapup');
@@ -943,7 +957,8 @@ export class WorkerService implements WorkerRef {
       SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH).CLAUDE_MEM_WORKER_INGEST_MAX_BYTES,
     ));
 
-    this.server.registerRoutes(new ViewerRoutes(this.sseBroadcaster, this.dbManager, this.sessionManager));
+    this.server.registerRoutes(new ViewerRoutes(this.sseBroadcaster, this.dbManager, this.sessionManager,
+      () => this.viewerSync.getSnapshot()));
     const sessionRoutes = new SessionRoutes(this.sessionManager, this.dbManager, this.sdkAgent, this.geminiAgent, this.openRouterAgent, this.sessionEventBroadcaster, this, this.completionHandler, this.codexAgent, this.openAICompatAgent);
     this.server.registerRoutes(sessionRoutes);
     this.startPendingSessionResume(sessionRoutes);
@@ -1002,7 +1017,23 @@ export class WorkerService implements WorkerRef {
 
   async start(): Promise<void> {
     const port = getWorkerPort();
-    const host = getWorkerHost();
+    // A leftover CLAUDE_MEM_TV_TOKEN with a non-loopback host and no local API
+    // token binds to loopback: see resolveWorkerBindHost.
+    const host = resolveWorkerBindHost({
+      configuredHost: getWorkerHost(),
+      legacyTvToken: readLegacyTvToken(USER_SETTINGS_PATH),
+      localApiTokenSet: this.localApiTokenEnabled,
+    });
+
+    // The token crosses a plain-HTTP hop only when the user names a remote host
+    // (#6390): say so, once, at boot.
+    warnOnPlainHttpRemoteTokenHost({
+      configuredHost: getWorkerHost(),
+      localApiTokenSet: this.localApiTokenEnabled,
+      remoteTokenHost: SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH, false, { readOnly: true })
+        .CLAUDE_MEM_LOCAL_API_TOKEN_REMOTE_HOST,
+      workerUrl: buildWorkerUrl('/api/health'),
+    });
 
     // Phase 3 telemetry: bridge logged errors into PostHog Error Tracking
     // WITHOUT the logger importing telemetry (no import cycle). captureException
@@ -1055,23 +1086,6 @@ export class WorkerService implements WorkerRef {
     // that has not finished or failed (buildAutoUpdateCheckDeps).
     this.startAutoUpdateTimer();
 
-    if (this.tvToken) {
-      // Operators need to see, in the log, that a remote surface is open.
-      // Never log the token itself.
-      logger.info('SYSTEM', 'Observation TV remote broadcast enabled', {
-        host,
-        allowedPaths: ['/tv', '/tv.html', '/stream', 'GET /api/observations'],
-      });
-    } else if (host !== '127.0.0.1' && host !== '::1' && host !== '::ffff:127.0.0.1' && host !== 'localhost') {
-      // Warn, do not refuse to bind: docs/docker.md tells people to set
-      // CLAUDE_MEM_WORKER_HOST=0.0.0.0, and refusing would break that install.
-      logger.warn(
-        'SECURITY',
-        'Worker bound to a non-loopback host with no CLAUDE_MEM_TV_TOKEN — the full worker API, including provider API keys via GET /api/settings, is reachable from the network',
-        { host }
-      );
-    }
-
     writePidFile({
       pid: process.pid,
       port,
@@ -1113,7 +1127,7 @@ export class WorkerService implements WorkerRef {
       ModeManager.getInstance().loadMode(modeId);
       logger.info('SYSTEM', `Mode loaded: ${modeId}`);
 
-      const dependencyHealth = runWorkerDependencyPreflight({
+      const dependencyHealth = await runWorkerDependencyPreflight({
         settings,
         classifyClaudeError,
       });
@@ -1211,7 +1225,7 @@ export class WorkerService implements WorkerRef {
         // Hook rows an agent wrote are kept out of goals, work and rules extraction.
         setupScan: new SetupScan({
           getStore: () => this.dbManager.getSessionStore(),
-          // Hosted setup does not probe or wait for an agent login.
+          // The refresh runner checks the configured agent when the scan has work to organize.
           saveAgentWrittenPromptIds: promptIds => writeJsonAtomic(path.join(DATA_DIR, 'work-view', AGENT_WRITTEN_PROMPTS_FILE), { promptIds, updatedAt: new Date().toISOString() }),
         }),
         // Finish Setup's history upload to CMEM Pro, with the setup token checkout saved.
@@ -1312,6 +1326,9 @@ export class WorkerService implements WorkerRef {
       }
       const searchRecencyWindowMs = parsedRecencyWindowMs ?? SEARCH_CONSTANTS.RECENCY_WINDOW_MS;
       const contextReader = getContextReadWorker();
+      contextReader.setTimeoutListener(({ method, queuedMs, runningMs }) => {
+        captureEvent('context_read_timed_out', { read_method: method, queue_wait_ms: queuedMs, duration_ms: runningMs });
+      });
       const searchManager = new SearchManager(
         this.dbManager.getSessionSearch(),
         this.dbManager.getSessionStore(),
@@ -1330,6 +1347,7 @@ export class WorkerService implements WorkerRef {
           return this.searchRoutes.renderContextVariant(keys);
         },
         expandProjectReadKeys: (projects) => contextReader.readKeys(projects),
+        listCatalogProjects: () => this.dbManager.getSessionStore().getProjectCatalog().projects,
         // Local-first: the local db is the source of truth, so the files are
         // servable with or without cloud sync. Sync applies other devices' ops in
         // the background, and every applied op invalidates the files (SyncApply).
@@ -1372,6 +1390,13 @@ export class WorkerService implements WorkerRef {
       // disabled, and list/restore work against snapshots already on disk.
       this.server.registerRoutes(new BackupRoutes(this.dbManager));
       logger.info('WORKER', 'BackupRoutes registered');
+
+      // Install the terminal 404 and error handlers after the last route.
+      // Without them the worker keeps Express's default handler, which answers a
+      // forwarded error (such as a malformed JSON body) with an HTML page that
+      // carries a stack trace and absolute paths, and an unknown route with an
+      // HTML 404 instead of the JSON the rest of the API speaks.
+      this.server.finalizeRoutes();
 
       this.initializationCompleteFlag = true;
       this.resolveInitialization();
@@ -1518,6 +1543,11 @@ export class WorkerService implements WorkerRef {
       // /api/ready readers must recycle.
       if (!this.initializationCompleteFlag) {
         this.initPhaseTracker.setInitPhase('failed', error instanceof Error ? error.message : String(error));
+      }
+      // A failed start still answers with JSON. Its /api and /v1 requests keep
+      // getting the init gate's 503; only unknown paths and errors reach these.
+      if (!this.server.routesFinalized) {
+        this.server.finalizeRoutes();
       }
     }
   }
@@ -1724,9 +1754,10 @@ export class WorkerService implements WorkerRef {
       restartHandoff: {
         port: getWorkerPort(),
         portFreeTimeoutMs: getPlatformTimeout(5000),
-        // Prefer the marketplace-installed script so the successor boots the
-        // freshly-synced plugin, falling back to this script for dev trees /
-        // CI where no marketplace copy exists.
+        // Resolve the successor through the shared oracle — the highest
+        // version with a complete dependency closure, cache before
+        // marketplace — falling back to this script for dev trees / CI
+        // where no installed copy exists.
         resolveSuccessorScript: () => resolveWorkerScriptPath() ?? __filename,
         waitForPortFree,
         // Owner-or-dead guarded (Phase 5): the dying worker may delete the
@@ -1785,7 +1816,7 @@ export class WorkerService implements WorkerRef {
 }
 
 export async function ensureWorkerStarted(port: number): Promise<WorkerStartResult> {
-  return ensureWorkerStartedShared(port, __filename);
+  return ensureWorkerStartedShared(port, resolveWorkerScriptPath() ?? __filename);
 }
 
 export type ParsedWorkerCommand = {
@@ -1876,8 +1907,10 @@ function runServerServiceCli(command: string, extraArgs: string[] = []): void {
   });
 }
 
-function parseServerApiKeyOptions(args: string[]): Record<string, string> {
-  const options: Record<string, string> = {};
+// A flag given without a value (`--scope`, `--scope=`, `--scope --name x`)
+// maps to null so callers can reject it instead of reading a placeholder.
+function parseServerApiKeyOptions(args: string[]): Record<string, string | null> {
+  const options: Record<string, string | null> = {};
   for (let i = 0; i < args.length; i++) {
     const item = args[i];
     if (!item.startsWith('--')) {
@@ -1885,19 +1918,39 @@ function parseServerApiKeyOptions(args: string[]): Record<string, string> {
     }
     const equals = item.indexOf('=');
     if (equals !== -1) {
-      options[item.slice(2, equals)] = item.slice(equals + 1) || 'true';
+      options[item.slice(2, equals)] = item.slice(equals + 1) || null;
       continue;
     }
     const key = item.slice(2);
     const next = args[i + 1];
     if (!next || next.startsWith('--')) {
-      options[key] = 'true';
+      options[key] = null;
       continue;
     }
     options[key] = next;
     i++;
   }
   return options;
+}
+
+// Every api-key option takes a value; reject a valueless one before any write
+// so it is never read as a default (an unrestricted --project, default scopes).
+function requireServerApiKeyOptionValues(options: Record<string, string | null>, usage: string): Record<string, string> {
+  for (const [key, value] of Object.entries(options)) {
+    if (value === null) {
+      console.error(`--${key} requires a value`);
+      console.error(usage);
+      process.exit(1);
+    }
+  }
+  return options as Record<string, string>;
+}
+
+function parseServerApiKeyScopes(options: Record<string, string>): string[] {
+  const scopeFlag = options.scope ?? options.scopes;
+  return scopeFlag
+    ? scopeFlag.split(',').map(scope => scope.trim()).filter(Boolean)
+    : [...DEFAULT_LOCAL_API_KEY_SCOPES];
 }
 
 function openServerCommandDatabase(): Database {
@@ -1915,14 +1968,12 @@ function runServerApiKeyCli(args: string[]): never {
       // #2428 — when no --scope is passed, default to the scopes the local v1
       // routes actually require (read + write) so a default key works instead
       // of being authorized for nothing.
-      const scopeFlag = options.scope ?? options.scopes;
-      const scopes = scopeFlag
-        ? scopeFlag.split(',').map(scope => scope.trim()).filter(Boolean)
-        : [...DEFAULT_LOCAL_API_KEY_SCOPES];
+      const values = requireServerApiKeyOptionValues(options, 'Usage: worker-service server api-key create [--name <name>] [--team <id>] [--project <id>] [--scope <a,b>]');
+      const scopes = parseServerApiKeyScopes(values);
       const created = createServerApiKey(db, {
-        name: options.name ?? 'server-api-key',
-        teamId: options.team ?? null,
-        projectId: options.project ?? null,
+        name: values.name ?? 'server-api-key',
+        teamId: values.team ?? null,
+        projectId: values.project ?? null,
         scopes,
       });
       console.log(JSON.stringify({
@@ -1975,10 +2026,7 @@ function runServerApiKeyCli(args: string[]): never {
         console.error('Usage: worker-service server api-key migrate-scopes <id> [--scope a,b]');
         process.exit(1);
       }
-      const scopeFlag = options.scope ?? options.scopes;
-      const scopes = scopeFlag
-        ? scopeFlag.split(',').map(scope => scope.trim()).filter(Boolean)
-        : [...DEFAULT_LOCAL_API_KEY_SCOPES];
+      const scopes = parseServerApiKeyScopes(requireServerApiKeyOptionValues(options, 'Usage: worker-service server api-key migrate-scopes <id> [--scope a,b]'));
       const updated = migrateServerApiKeyScopes(db, id, scopes);
       if (!updated) {
         console.error(`API key not found: ${id}`);
@@ -2001,6 +2049,11 @@ export async function main() {
   // Load the bundle without binding a port or depending on a running worker.
   if (command === '--version') {
     console.log(packageVersion);
+    return;
+  }
+  if (command === 'messages') {
+    const { runMessagesCommand } = await import('../cli/messages-command.js');
+    process.exitCode = runMessagesCommand(commandArgs);
     return;
   }
   if (command === 'media-smoke') {
@@ -2163,9 +2216,10 @@ export async function main() {
       const restartFreed = handoffSawLiveWorker
         ? false
         : await waitForPortFree(port, getPlatformTimeout(15000));
-      // Prefer the marketplace-installed script so restart boots the
-      // freshly-synced plugin, falling back to this script for dev trees /
-      // CI where no marketplace copy exists.
+      // Resolve the restart target through the shared oracle — the highest
+      // version with a complete dependency closure, cache before
+      // marketplace — falling back to this script for dev trees / CI where
+      // no installed copy exists.
       const restartScript = resolveWorkerScriptPath() ?? __filename;
       let spawnedScript = 'none (port still bound — nothing spawned)';
       let spawnLockHeld = false;
@@ -2241,14 +2295,28 @@ export async function main() {
         if (typeof health.uptime === 'number') {
           console.log(`  Uptime: ${health.uptime}s`);
         }
-        if (typeof health.workerPath === 'string') {
-          console.log(`  Worker path: ${health.workerPath}`);
+        // /api/health publishes probe state only. The install path and the
+        // queue's address live on the loopback-only doctor route, which fails
+        // for a remote --worker-url; there the two lines are simply omitted.
+        const details = await fetchWorkerDoctor(getPlatformTimeout(3000));
+        if (typeof details?.health?.workerPath === 'string' && details.health.workerPath) {
+          console.log(`  Worker path: ${details.health.workerPath}`);
+          // A worker rooted outside the resolved plugin root — the
+          // leftover-alias case of #6228 — runs a copy whose dependencies
+          // and updates the install does not control, and nothing else
+          // flags it: hooks and the MCP server compare versions only.
+          // Skipped for an explicit worker URL: that worker's path belongs
+          // to another machine, so the local resolved root says nothing.
+          const resolvedRoot = explicitWorkerUrl ? null : resolvePluginRoot();
+          if (resolvedRoot && isWorkerScriptOutsideRoot(details.health.workerPath, resolvedRoot.root)) {
+            console.log(`  Warning: the worker is running from outside the resolved plugin root (${resolvedRoot.root}) — \`claude-mem restart\` boots the resolved install instead.`);
+          }
         }
         const dependencyHint = formatDependencyHealthHint(health);
         if (dependencyHint) {
           console.log(dependencyHint);
         }
-        printQueueStatusIfBullMq(health);
+        printQueueStatusIfBullMq(details);
         process.exit(0);
       }
       if (explicitWorkerUrl) {
@@ -2626,16 +2694,32 @@ export interface WorkerHealthSnapshot {
   pid?: unknown;
   version?: unknown;
   uptime?: unknown;
-  workerPath?: unknown;
   dependencies?: DependencyHealthSnapshot;
+  /** The probe answer: the queue engine, Redis's status and the per-lane counts, never its address. */
   queue?: {
-    redis?: {
-      status?: string;
-      host?: string;
-      port?: number;
-      mode?: string;
-      prefix?: string;
-      error?: string;
+    engine?: string;
+    redis?: { status?: string };
+    lanes?: unknown[];
+  };
+}
+
+/**
+ * The loopback-only `/api/admin/doctor` detail that `/api/health` keeps off its
+ * unauthenticated answer: the worker's install path and the queue backend's
+ * address. `status` reads it here, on the machine that runs the worker.
+ */
+export interface WorkerDoctorSnapshot {
+  health?: {
+    workerPath?: unknown;
+    queue?: {
+      redis?: {
+        status?: string;
+        host?: string;
+        port?: number;
+        mode?: string;
+        prefix?: string;
+        error?: string;
+      };
     };
   };
 }
@@ -2672,18 +2756,33 @@ async function fetchWorkerHealth(timeoutMs: number): Promise<WorkerHealthSnapsho
 }
 
 /**
- * Print BullMQ queue detail from an already-fetched /api/health snapshot.
- * A degraded worker answers 503 but still includes the queue block, and
- * `status` already treats that worker as running — so this must not
- * re-fetch and bail on a non-2xx response (which hid the queue detail
- * behind "BullMQ health unavailable (HTTP 503)"). Reusing the snapshot in
- * hand keeps the output consistent with what `status` just reported.
+ * Fetch the loopback-only detail `status` prints beside the probe answer.
+ * Returns null when the route is unreachable or refuses a remote `--worker-url`
+ * (it is localhost-only), so `status` keeps working against a remote worker.
+ * `workerHttpRequest` carries the local API token when the operator set one.
  */
-function printQueueStatusIfBullMq(health: WorkerHealthSnapshot): void {
+async function fetchWorkerDoctor(timeoutMs: number): Promise<WorkerDoctorSnapshot | null> {
+  try {
+    const response = await workerHttpRequest('/api/admin/doctor', { timeoutMs });
+    if (!response.ok) return null;
+    return await response.json() as WorkerDoctorSnapshot;
+  } catch {
+    // [ANTI-PATTERN IGNORED]: an optional detail fetch — any failure means the two detail lines are omitted, and every `status` run already logs what it has.
+    return null;
+  }
+}
+
+/**
+ * Print BullMQ queue detail from the loopback-only doctor snapshot. The queue
+ * address is part of the deployment, not probe state, so `/api/health` no
+ * longer carries it; `/api/admin/doctor` is reachable from the machine that
+ * runs `status`, and a remote `--worker-url` simply omits the line.
+ */
+function printQueueStatusIfBullMq(doctor: WorkerDoctorSnapshot | null): void {
   if (SettingsDefaultsManager.get('CLAUDE_MEM_QUEUE_ENGINE').trim().toLowerCase() !== 'bullmq') {
     return;
   }
-  const redis = health.queue?.redis;
+  const redis = doctor?.health?.queue?.redis;
   if (!redis) {
     return;
   }

@@ -1,7 +1,7 @@
 import type express from 'express';
 import type { Request, Response, NextFunction } from 'express';
-import { createHash, randomBytes } from 'node:crypto';
-import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, renameSync, writeFileSync } from 'node:fs';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, extname, join } from 'node:path';
 import { z } from 'zod';
@@ -20,7 +20,7 @@ import { FILE_CONTENT_TYPES } from '../../../work-view/work-product.mjs';
 import { isInsideDeliverablesDir } from '../../../../shared/deliverables.js';
 import { contentFingerprint, priorContentFingerprint, LocalReviewStore } from '../../../work-view/review-store.js';
 import { MY_RULES_LIST, renderRulesFile, ruleRowFields, type SavedRule } from '../../../work-view/my-rules.mjs';
-import { claudeCodeImportLine, homeRelativePath, RULES_AND_TOOLS_FILENAME } from '../../../../shared/claude-code-rules-import.js';
+import { claudeCodeImportLine, hasImportLine, homeRelativePath, RULES_AND_TOOLS_FILENAME } from '../../../../shared/claude-code-rules-import.js';
 import { ensureRulesAndToolsFile } from '../../../context/RulesAndToolsFile.js';
 import { focusAreaRowFields, MY_FOCUS_LIST, navWordIn, OTHER_FOCUS_AREA_ID, ownerGoalsAreaRows, placementRowFields, PROPOSAL_KINDS, readFocus, routerFocusRows, seedFocusRows, seedUndoRows, type FocusArea, type RouterFocusBody } from '../../../work-view/my-focus.mjs';
 import { MAX_WORK_STATE_FIELDS_JSON_CHARS } from '../../../work-view/work-state-limits.mjs';
@@ -38,11 +38,13 @@ import { FocusSharePublisher } from '../../../work-view/focus-share-publisher.js
 import { cmemProOrigin } from '../../../../shared/cmem-gateway.js';
 import { isOpenRouterApiUrl } from '../../../../shared/openrouter-base-url.js';
 import { FOCUS_CHANGED_MESSAGE, focusChangeVersion } from '../../../../shared/focus-change-version.js';
+import { REFRESH_START_REFUSAL } from '../../../../shared/work-view-refresh-reasons.js';
 import { runAgentTask } from '../../../agent-runner/run.js';
 import { ledgerSignature, readLedger } from '../../../work-view/request-groups.mjs';
 import { configuredJudge, decideSuggestion, jevClientFromSettings } from '../../../work-view/request-judge.mjs';
 import { labelOpenWorkState } from '../../../work-view/work-state-labels.mjs';
-import { normalizeRequestStatus } from '../../../../ui/my-work/src/live/status-normalization.js';
+import { isReportedReadyForCheck } from '../../../work-view/review-readiness.js';
+export { isReportedReadyForCheck } from '../../../work-view/review-readiness.js';
 import { configuredFocusJudge } from '../../../work-view/focus-judge.mjs';
 import { BaseRouteHandler } from '../BaseRouteHandler.js';
 import { captureEvent } from '../../../telemetry/telemetry.js';
@@ -53,51 +55,19 @@ import { readHistoryCounts, type HistoryImport } from '../../../setup/history-im
 import { createSetupTelemetry } from '../../../setup/telemetry.js';
 import { createSetupInstallerResumer } from '../../../setup/resume-installer.js';
 import { hasActiveSetupSession, hasProConfiguration, readSetupState, setupStatePath, writeSetupState, type SetupStateFile, type SetupStateView } from '../../../../shared/setup-state.js';
-import { SETUP_BRANCHES, SETUP_INSTALLER_STAGES, SETUP_MEMORY_BILLINGS } from '../../../../shared/setup-funnel.js';
-import { hasPendingInstallSetup, SETUP_INSTALL_STATUSES } from '../../../../shared/setup-install.js';
+import { toSetupUsage } from '../../../../shared/setup-usage.js';
+import { historyImportRunning, SETUP_BRANCHES, SETUP_CLOUD_SYNC_OFFERS, SETUP_INSTALLER_STAGES, SETUP_MEMORY_BILLINGS, setupCloudSyncOffer } from '../../../../shared/setup-funnel.js';
+import { hasPendingInstallSetup, SETUP_DSH_PROFILE_MAX_CHARACTERS, SETUP_INSTALL_NOTE_MAX_CHARACTERS, SETUP_INSTALL_STATUSES } from '../../../../shared/setup-install.js';
 import {
   CONTINUABLE_PLATFORMS, CONVERSATION_SESSION_UUID_PATTERN, OPEN_IN_APP_CLICK_ID_PATTERN, type ConversationContinuation, type ConversationContinuationNotice,
   type ConversationOpenedInApp,
 } from '../../../../shared/conversation-continuation.js';
 import type { ConversationContinuationRunner } from '../../../work-view/conversation-continuation-runner.js';
 
-// A request is ready for a human check once its explicit lifecycle reports it complete, shipped, or waiting for review.
-// Statuses are compared lowercased with `_` and spaces read as `-`, matching the viewer's status normalization.
-const READY_FOR_CHECK_LIFECYCLE_STATUSES = [
-  'done', 'completed', 'complete', 'shipped', 'delivered',
-  'needs-review', 'review', 'in-review', 'awaiting-review', 'ready-for-review',
-];
-type RecordedLifecycle = { explicit?: boolean; complete?: boolean | null; status?: string | null; atEpoch?: number | null } | null | undefined;
-type ReadyCheckItem = { kind: string; status: string; judgedStatus?: string | null; lastUpdateEpoch?: number };
-
-/** Mirrors the viewer's reviewIsNewerThanLifecycle (src/ui/my-work/src/live/to-work-model.ts). */
-function reviewIsNewerThanLifecycle(review: { checkedAt?: string | null }, lifecycle: RecordedLifecycle): boolean {
-  if (!lifecycle?.explicit || !lifecycle.atEpoch) return true;
-  const reviewedAt = Date.parse(review.checkedAt ?? '');
-  return Number.isFinite(reviewedAt) && reviewedAt >= lifecycle.atEpoch;
-}
-
 /** True while a process with this pid exists (signal 0 checks without signalling). */
 function processIsAlive(pid: number): boolean {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try { process.kill(pid, 0); return true; } catch { return false; }
-}
-
-/** Ready for a person's check: the explicit lifecycle says so, or a memory review newer than it reached 100%.
- * The viewer offers "Mark checked" on exactly these requests. */
-export function isReportedReadyForCheck(request: { lifecycle?: RecordedLifecycle; progress?: { percent?: number; checkedAt?: string | null } | null; items?: ReadyCheckItem[] }, now = Date.now()): boolean {
-  const { lifecycle, progress } = request;
-  if (progress?.percent === 100 && reviewIsNewerThanLifecycle(progress, lifecycle)) return true;
-  // Item statuses, Jev's judged ones included, read with the viewer's own rule: an item an agent marked needs-review,
-  // or one a confident label judged finished, makes the viewer offer "Mark checked", so the check is accepted.
-  if (request.items?.length) {
-    const itemStatus = normalizeRequestStatus({ items: request.items, checked: false,
-      lifecycle: lifecycle?.explicit ? { status: lifecycle.status ?? null, explicit: true, complete: lifecycle.complete } : null }, now);
-    if (itemStatus === 'needs-review' || itemStatus === 'done') return true;
-  }
-  if (!lifecycle?.explicit) return false;
-  const status = String(lifecycle.status ?? '').trim().toLowerCase().replace(/[_ ]/g, '-');
-  return lifecycle.complete === true || READY_FOR_CHECK_LIFECYCLE_STATUSES.includes(status);
 }
 
 /** Recorded files plus the text kinds an agent attaches as a deliverable, served so a browser shows them rather than downloads them. */
@@ -323,7 +293,7 @@ interface WorkViewOptions {
   setupTelemetry?: ReturnType<typeof createSetupTelemetry>;
   /** Read for `alreadyPro`; defaults to ~/.claude-mem/settings.json. */
   settingsPath?: string;
-  /** Finish Setup's history upload to CMEM Pro. Without it POST /api/setup/import answers 503. */
+  /** Finish Setup's history upload to CMEM Pro. Without it POST /api/setup/import and /api/setup/import/stop answer 503. */
   historyImport?: HistoryImport | null;
   /** Setup extraction only. Ongoing automatic refresh continues to use the local agent runner. */
   hostedIntent?: Pick<HostedIntent, 'run' | 'state'> | null;
@@ -347,7 +317,8 @@ const setupScanConsentBody = z.object({ upload: z.boolean(), agents: z.array(z.e
 const setupScanPreferencesBody = z.object({ improveProduct: z.boolean() }).strict();
 // Request-size and abuse caps on loopback writes, set about twice what the installer offers today (measured
 // 2026-11-11: 19 agents in ide-detection.ts, 30 bundled skills, the longest id 17 characters). The email cap is RFC 5321's 254-character path
-// limit; the note and error caps match the setup page's textarea and the installer's other setup errors.
+// limit; the legacy signup note's is SETUP_INSTALL_NOTE_MAX_CHARACTERS (setup-install.ts), the
+// same 2,000 characters as the installer's error reports below.
 const setupInstallId = z.string().min(1).max(80);
 const setupInstallSelectionBody = z.object({
   agents: z.array(setupInstallId).min(1).max(40),
@@ -356,10 +327,10 @@ const setupInstallSelectionBody = z.object({
   disableAutoMemory: z.boolean(),
   telemetryEnabled: z.boolean(),
   email: z.union([z.literal(''), z.email().max(254)]).optional(),
-  note: z.string().max(2000).optional(),
+  note: z.string().max(SETUP_INSTALL_NOTE_MAX_CHARACTERS).optional(),
   emailProvided: z.boolean().optional(),
   claudeModel: z.string().trim().min(1).max(200).optional(),
-  dshProfile: z.string().trim().min(1).max(200).optional(),
+  dshProfile: z.string().trim().min(1).max(SETUP_DSH_PROFILE_MAX_CHARACTERS).optional(),
 }).strict();
 const setupInstallCatalogBody = z.object({
   agents: z.array(z.object({ id: setupInstallId, label: z.string().max(200), hint: z.string().max(1000), detected: z.boolean() }).strict()).min(1).max(40),
@@ -387,12 +358,19 @@ function redactSetupInstall(install: SetupStateFile['install']): SetupStateFile[
   return { ...install, selection: email ? { ...selection, emailProvided: true } : selection };
 }
 
-// On The Go is always CMEM Pro: standalone Cloud Sync on your own tokens has no price yet (gap G1).
+// Cloud Sync can use the existing provider. An explicit offer never changes a local or legacy hosted choice.
 const setupChoiceBody = z.object({
   branch: z.enum(SETUP_BRANCHES),
   memoryBilling: z.enum(SETUP_MEMORY_BILLINGS),
-}).strict().refine(choice => choice.branch === 'home' || choice.memoryBilling === 'hosted', {
-  message: 'On The Go uses CMEM Pro (memoryBilling "hosted").',
+  cloudSyncOffer: z.enum(SETUP_CLOUD_SYNC_OFFERS).optional(),
+  shareWorkView: z.literal(true).optional(),
+  openCheckout: z.literal(true).optional(),
+}).strict().refine(choice => !choice.cloudSyncOffer || (choice.branch === 'go' && choice.memoryBilling === 'existing'), {
+  message: 'A Cloud Sync offer requires On The Go with your existing memory provider.',
+}).refine(choice => !choice.shareWorkView || !!choice.cloudSyncOffer, {
+  message: 'Work View sharing requires an explicit standalone Cloud Sync offer.',
+}).refine(choice => !choice.openCheckout || !!choice.cloudSyncOffer, {
+  message: 'Select a Cloud Sync offer to open its checkout.',
 });
 const setupInstallerBody = z.object({
   stage: z.enum(SETUP_INSTALLER_STAGES),
@@ -488,7 +466,7 @@ export function defaultAutoRefresh(ledgerDir: string, settingsPath = USER_SETTIN
     database.exec('PRAGMA busy_timeout = 1500');
     return database;
   };
-  // Setup's only extraction is hosted. Once setup is complete, ongoing refresh keeps its existing local path.
+  // Scheduled and manual refresh wait while the setup scan uses the worker.
   const setupRunning = () => {
     const state = readSetupState(setupPath);
     return setupActive() || hasPendingInstallSetup(state) || (state.status !== 'complete' && hasActiveSetupSession(setupPath));
@@ -502,8 +480,9 @@ export function defaultAutoRefresh(ledgerDir: string, settingsPath = USER_SETTIN
       && SettingsDefaultsManager.loadFromFile(settingsPath, true, { readOnly: true }).CLAUDE_MEM_WORK_VIEW_AUTO_REFRESH !== 'false',
     runJob: async ({ needs, reason }) => {
       // The judges are read from settings per run, so a provider change applies to the next refresh.
+      const setup = reason === 'setup-scan';
       const task = buildRefreshTask({ needs, reason, dataDir: DATA_DIR, ledgerDir, pluginRoot: getPackageRoot(), openDatabase, localDeviceId, saveFocus,
-        judge: configuredJudge(settingsPath), focusJudge: configuredFocusJudge(settingsPath) });
+        judge: setup ? null : configuredJudge(settingsPath), focusJudge: setup ? null : configuredFocusJudge(settingsPath) });
       return { ...(await runAgentTask(task)), steps: task.steps };
     },
     // Jev labels open work-state items on every check; read from settings each time, like the judges.
@@ -566,6 +545,7 @@ export class WorkViewRoutes extends BaseRouteHandler {
   private claudeInstructionsPath: string;
   private setupScan: SetupScan | null;
   private setupStatePath: string;
+  private setupReadExhausted = false;
   private setupTelemetry: ReturnType<typeof createSetupTelemetry> | null = null;
   private settingsPath: string;
   private unsubscribeSetupScan: (() => void) | null = null;
@@ -656,6 +636,12 @@ export class WorkViewRoutes extends BaseRouteHandler {
       ? new FocusSharePublisher({ shares: this.focusShares, snapshot: () => this.snapshot(0, 'shared-focus'), everyMs: options.focusSharePublishEveryMs })
       : null;
     this.focusSharePublisher?.start();
+    if (this.autoRefresh) this.setupScan?.setLocalExtractor(async () => {
+      const result = await this.autoRefresh!.runNow({ reason: 'setup-scan' });
+      if (result === 'ok' || result === 'idle') return true;
+      if (result === 'waiting-for-agent' || result === 'failed') return false;
+      throw new Error('Another refresh is running. Try again when it finishes.');
+    });
     if (this.hostedIntent) this.setupScan?.setExtractor((prompts, improveProduct) => this.hostedIntent!.run(prompts, improveProduct));
     this.unsubscribeHistoryImport = this.historyImport?.subscribe(state => this.broadcast('setup-import', state)) ?? null;
     // Hosted extraction is awaited inside the scan, so failures stay in the scan screen's error slot.
@@ -695,8 +681,20 @@ export class WorkViewRoutes extends BaseRouteHandler {
     // Waiting for the upload answer is not active: a closed tab never answers, and that must not hold local work
     // paused. The installer's session below still covers a setup in progress; reopening the page rejoins the question.
     if (!['idle', 'done', 'failed', 'awaiting-consent'].includes(scanPhase)) return true;
-    const state = readSetupState(statePath);
-    return hasPendingInstallSetup(state) || (state.status !== 'complete' && hasActiveSetupSession(statePath));
+    try {
+      const state = readSetupState(statePath);
+      const active = hasPendingInstallSetup(state) || (state.status !== 'complete' && hasActiveSetupSession(statePath));
+      this.setupReadExhausted = false;
+      return active;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== 'EMFILE' && code !== 'ENFILE') throw error;
+      // The machine is out of file descriptors, not the setup files. Unknown setup keeps local paid work paused.
+      // A failed open holds no descriptor, so every tick reads again; the warning is logged once per episode.
+      if (!this.setupReadExhausted) logger.warn('WORKER', 'Could not read setup state: no file descriptors are free. Local work stays paused until a read succeeds.', { code });
+      this.setupReadExhausted = true;
+      return true;
+    }
   }
 
   private scheduleRulesFileRebuild(): void {
@@ -952,20 +950,26 @@ export class WorkViewRoutes extends BaseRouteHandler {
     app.post('/api/setup/installer', workViewLoopbackOnly, requireWorkViewOrigin, validateBody(setupInstallerBody), this.wrapHandler(this.saveInstallerStage));
     app.post('/api/setup/checkout', workViewLoopbackOnly, requireWorkViewOrigin, validateBody(setupCheckoutBody), this.wrapHandler(this.requestCheckout));
     app.post('/api/setup/import', workViewLoopbackOnly, requireWorkViewOrigin, validateBody(setupImportBody), this.wrapHandler(this.startHistoryImport));
+    // Finish Setup's "Stop import": the same guards. It only ends a run; the person's own POST above starts one again.
+    app.post('/api/setup/import/stop', workViewLoopbackOnly, requireWorkViewOrigin, validateBody(setupImportBody), this.wrapHandler(this.stopHistoryImport));
     app.post('/api/setup/complete', workViewLoopbackOnly, requireWorkViewOrigin, validateBody(setupCompleteBody), this.wrapHandler(this.completeSetup));
   }
 
   private setupStateView(state: SetupStateFile = readSetupState(this.setupStatePath)): SetupStateView {
     const settings = SettingsDefaultsManager.loadFromFile(this.settingsPath, true, { readOnly: true }) as unknown as Record<string, unknown>;
     const historyImport = this.historyImport?.state() ?? null;
-    return { ...state, install: redactSetupInstall(state.install), alreadyPro: hasProConfiguration(settings), history: this.historyCounts(), historyImport, backgroundWorkRunning: this.backgroundWorkRunning({ countScanWaitingForUploadAnswer: true }) };
+    return { ...state, install: redactSetupInstall(state.install), alreadyPro: hasProConfiguration(settings), history: this.historyCounts(), historyImport, backgroundWorkRunning: this.backgroundWorkRunning({ countScanWaitingForUploadAnswer: true, failOnUnreadableRefresh: false }) };
   }
 
   /**
    * Long work this worker is doing now that a restart would kill (SetupStateView.backgroundWorkRunning): the
    * extraction run and the history import. GET /api/setup/state reports it, and the installer waits for it before
    * any restart (browser-setup.ts waitForBackgroundWorkToFinish); the auto-updater counts it as busy
-   * (worker-service.ts runningBackgroundJobNames). Reads refresh.json; throws when that file cannot be read.
+   * (worker-service.ts runningBackgroundJobNames). Reads refresh.json.
+   *
+   * failOnUnreadableRefresh: what a refresh.json that cannot be read means. The auto-updater throws, so its quiet
+   * check counts the unknown run as busy. The setup state view reads it as no run: a throw there failed every setup
+   * state request, the installer's and My Work's, until the file was replaced. The next scheduled check replaces it.
    *
    * countScanWaitingForUploadAnswer: whether a setup scan held at the "upload your prompts?" question
    * ('awaiting-consent') counts as the extraction run. The installer's view counts it, as it always has. The
@@ -973,16 +977,17 @@ export class WorkViewRoutes extends BaseRouteHandler {
    * answers), and a restart drops it anyway, so counting it would read busy until the worker restarts.
    * setupIsActive leaves that phase out for the same reason.
    */
-  backgroundWorkRunning({ countScanWaitingForUploadAnswer }: { countScanWaitingForUploadAnswer: boolean }): NonNullable<SetupStateView['backgroundWorkRunning']> {
+  backgroundWorkRunning({ countScanWaitingForUploadAnswer, failOnUnreadableRefresh }: { countScanWaitingForUploadAnswer: boolean; failOnUnreadableRefresh: boolean }): NonNullable<SetupStateView['backgroundWorkRunning']> {
     const backgroundWorkRunning: NonNullable<SetupStateView['backgroundWorkRunning']> = [];
-    const refresh = this.autoRefresh?.status() ?? null;
+    const refresh = failOnUnreadableRefresh ? this.autoRefresh?.status() ?? null : this.readableRefreshStatus();
     // A 'running' record whose process is gone was cut off; only a live run counts.
     // The setup scan counts too: when it finishes it starts the extraction run.
     const scanPhase = this.setupScan?.state().phase ?? 'idle';
     const scanning = !['idle', 'done', 'failed'].includes(scanPhase)
       && (countScanWaitingForUploadAnswer || scanPhase !== 'awaiting-consent');
     if (scanning || (refresh?.state === 'running' && processIsAlive(Number((refresh as { pid?: number }).pid)))) backgroundWorkRunning.push('extraction');
-    if (this.historyImport?.state().state === 'running') backgroundWorkRunning.push('history-import');
+    const importState = this.historyImport?.state().state;
+    if (importState && historyImportRunning(importState)) backgroundWorkRunning.push('history-import');
     return backgroundWorkRunning;
   }
 
@@ -1017,6 +1022,19 @@ export class WorkViewRoutes extends BaseRouteHandler {
     } catch (error) {
       res.status(409).json({ error: error instanceof Error ? error.message : String(error) });
     }
+  };
+
+  /**
+   * Finish Setup's "Stop import" (HistoryImport.stop): the upload ends at once and no request to cmem.ai starts after
+   * this answers. 200 with the stopped run (what was sent, and the batch whose answer never came); 409 with a sentence
+   * when no upload is running. What already reached cmem.ai stays there; nothing is deleted on either side.
+   */
+  private stopHistoryImport = (_req: Request, res: Response): void => {
+    if (!this.historyImport) { res.status(503).json({ error: 'Bringing your memory is unavailable on this worker.' }); return; }
+    const stopped = this.historyImport.stop();
+    if (!stopped) { res.status(409).json({ error: 'No import is running, so there is nothing to stop.' }); return; }
+    res.setHeader('Cache-Control', 'no-store');
+    res.json(stopped);
   };
 
   private saveSetupState(state: SetupStateFile, res: Response): void {
@@ -1083,17 +1101,36 @@ export class WorkViewRoutes extends BaseRouteHandler {
 
   /** The choice can change until the installer acts on it; after that the installer holds the result. */
   private saveSetupChoice = (req: Request, res: Response): void => {
-    const { branch, memoryBilling } = req.body as z.infer<typeof setupChoiceBody>;
+    const { branch, memoryBilling, cloudSyncOffer, shareWorkView, openCheckout } = req.body as z.infer<typeof setupChoiceBody>;
+    const offer = setupCloudSyncOffer({ branch, memoryBilling, cloudSyncOffer });
     const state = readSetupState(this.setupStatePath);
     if (state.status === 'complete') { res.status(409).json({ error: 'Setup is already complete.', state: this.setupStateView(state) }); return; }
     if (state.install && state.install.status !== 'ready') { res.status(409).json({ error: 'Finish installing your agents before choosing memory storage.' }); return; }
     const applied = state.installer && state.installer.stage !== 'waiting-for-choice' && state.installer.stage !== 'failed';
-    if (applied && (state.choice?.branch !== branch || state.choice?.memoryBilling !== memoryBilling)) {
+    // The first checkout request belongs to the plan saved in this same write. A repeat
+    // or a second browser tab cannot replace that plan while the terminal sets up pairing.
+    const sameChoice = state.choice?.branch === branch && state.choice.memoryBilling === memoryBilling
+      && setupCloudSyncOffer(state.choice) === offer && state.choice.shareWorkView === shareWorkView;
+    const locked = applied || (!!state.checkout && state.installer?.stage !== 'failed');
+    if (locked && !sameChoice) {
       res.status(409).json({ error: 'The installer already applied the earlier choice.', state: this.setupStateView(state) });
       return;
     }
-    if (applied) { res.setHeader('Cache-Control', 'no-store'); res.json(this.setupStateView(state)); return; }
-    this.saveSetupState({ ...state, choice: { branch, memoryBilling, chosenAt: new Date().toISOString() } }, res);
+    const now = new Date().toISOString();
+    // Older installers can have an applied choice with no checkout request yet.
+    let checkout = sameChoice ? state.checkout : null;
+    if (openCheckout && !checkout && !this.setupStateView(state).alreadyPro) {
+      checkout = { state: 'requested', requests: 1, error: null, updatedAt: now };
+    }
+    if (locked && checkout === state.checkout) { res.setHeader('Cache-Control', 'no-store'); res.json(this.setupStateView(state)); return; }
+    const scanUsage = offer && !state.choice?.usage ? this.setupScan?.state().usage : null;
+    const usage = state.choice?.usage ?? (scanUsage ? toSetupUsage(scanUsage) : undefined);
+    const choice = locked ? state.choice : {
+      branch, memoryBilling, chosenAt: now,
+      ...(shareWorkView ? { shareWorkView } : {}),
+      ...(offer ? { cloudSyncOffer: offer, ...(usage ? { usage } : {}) } : {}),
+    };
+    this.saveSetupState({ ...state, choice, checkout }, res);
   };
 
   private saveInstallerStage = (req: Request, res: Response): void => {
@@ -1236,18 +1273,26 @@ export class WorkViewRoutes extends BaseRouteHandler {
     return this.getSyncStatus ? { ...result, sync: this.getSyncStatus() } : result;
   }
 
+  /** refresh.json, or null when its bytes are not JSON, so a view shows no run; the next scheduled check replaces the file. */
+  private readableRefreshStatus() {
+    try { return this.autoRefresh?.status() ?? null; }
+    catch (error) { if (error instanceof SyntaxError) return null; throw error; }
+  }
+
   /**
    * The funnel's view of setup: the scan and the extraction run (the automatic refresh's status). `step` is what is
    * being extracted now, read from what has landed: goals first, then work (request groups), then rules (the story).
    */
   private setupView(snapshot: WorkViewSnapshot) {
+    const scan = this.setupScan?.state() ?? null;
     const hosted = this.hostedIntent?.state();
-    if (hosted && hosted.state !== 'idle') return { scan: this.setupScan?.state() ?? null, work: this.setupWork(), extraction: hosted };
-    const refresh = this.autoRefresh?.status() ?? null;
+    const ranHosted = scan && (scan.uploadedAgents !== null || (scan.done && scan.agents.every(agent => !agent.prompts)));
+    if (ranHosted && hosted && hosted.state !== 'idle') return { scan, work: this.setupWork(), extraction: hosted };
+    const refresh = this.readableRefreshStatus();
     const view = snapshot as unknown as { goals?: unknown; story?: { groups?: number; story?: unknown } | null };
     const step = refresh?.state !== 'running' ? null : !view.goals ? 'goals' : !view.story?.groups ? 'work' : 'rules';
     return {
-      scan: this.setupScan?.state() ?? null,
+      scan,
       work: this.setupWork(),
       extraction: refresh ? {
         state: refresh.state, reason: refresh.reason ?? null, step, agent: refresh.agent ?? null,
@@ -1305,7 +1350,8 @@ export class WorkViewRoutes extends BaseRouteHandler {
       path: homeRelativePath(this.rulesFilePath),
       instructionsPath: homeRelativePath(this.claudeInstructionsPath),
       approvedCount: renderRulesFile(rules).approvedCount,
-      loadedInClaudeCode: instructions.split('\n').some(line => line.trim() === myRulesImportLine(this.rulesFilePath)),
+      // Any spelling Claude Code loads counts (`@~/…` or an absolute `/` path), not only the one this worker writes.
+      loadedInClaudeCode: hasImportLine(instructions, this.rulesFilePath),
     };
   }
 
@@ -1338,9 +1384,16 @@ export class WorkViewRoutes extends BaseRouteHandler {
     // The import must never point at a missing file: Claude Code skips it without a word. SessionStart
     // keeps its text current (mode, runtime, settings), so only a missing file is written here.
     if (!existsSync(this.rulesAndToolsPath)) ensureRulesAndToolsFile(true, this.rulesAndToolsPath);
-    const temp = join(dirname(this.rulesFilePath), `.MY-RULES.md.${process.pid}.tmp`);
-    writeFileSync(temp, this.renderRulesMarkdown(rules), { mode: 0o644 });
-    renameSync(temp, this.rulesFilePath);
+    const temp = join(dirname(this.rulesFilePath), `.MY-RULES.md.${randomUUID()}.tmp`);
+    try {
+      writeFileSync(temp, this.renderRulesMarkdown(rules), { mode: 0o644, flag: 'wx' });
+      renameSync(temp, this.rulesFilePath);
+    } catch (error) {
+      // A failed write or rename (Windows EPERM/EBUSY while the target is held)
+      // would otherwise leave this randomly named temp behind on every attempt.
+      try { unlinkSync(temp); } catch { /* the temp may not exist */ }
+      throw error;
+    }
   }
 
   private saveRule = async (req: Request, res: Response): Promise<void> => {
@@ -1693,7 +1746,7 @@ export class WorkViewRoutes extends BaseRouteHandler {
 
   /** Starts an on-demand refresh and answers before the run ends, which can take many minutes. */
   private startManualRefresh = async (_req: Request, res: Response): Promise<void> => {
-    if (!this.autoRefresh) { res.status(503).json({ error: 'Refresh is unavailable on this worker.' }); return; }
+    if (!this.autoRefresh) { res.status(503).json({ error: REFRESH_START_REFUSAL.unavailable }); return; }
     const started = this.autoRefresh.runNow({ reason: 'manual' });
     // runNow decides before its first await: busy now means a run started, and any other answer is already settled.
     if (this.autoRefresh.busy) {
@@ -1702,8 +1755,8 @@ export class WorkViewRoutes extends BaseRouteHandler {
       return;
     }
     const state = await started;
-    if (state === 'setup-running') { res.status(409).json({ error: 'Refresh is unavailable until setup finishes.' }); return; }
-    if (state === 'closed') { res.status(503).json({ error: 'This worker is shutting down.' }); return; }
+    if (state === 'setup-running') { res.status(409).json({ error: REFRESH_START_REFUSAL.setupRunning }); return; }
+    if (state === 'closed') { res.status(503).json({ error: REFRESH_START_REFUSAL.shuttingDown }); return; }
     res.status(state === 'running' ? 202 : 200).json({ state });
   };
 

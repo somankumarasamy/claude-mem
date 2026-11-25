@@ -20,6 +20,10 @@
  *     schema gets it as `--output-schema`, so the final message is that JSON shape and nothing else.
  *   - Gemini: `gemini -p <line> --approval-mode plan -e none --allowed-mcp-server-names <none> -o json [-m <model>]`
  *     (gemini 0.49.0 `--help`: plan = read-only mode), prompt on stdin, no extensions or MCP servers.
+ *   - OpenCode 1.x: `opencode run --pure --format json --dir <cwd> --agent claude-mem-refresh [--model provider/model]`
+ *     (opencode 1.14 `run --help`); OpenCode 2.2.3+: `opencode run --standalone --format json --agent claude-mem-refresh [--model provider/model]`
+ *     (opencode 2.3.2 `run --help`, no `--pure`/`--dir`; a `plugin.use` policy keeps plugins out). Prompt on stdin,
+ *     no MCP servers and an agent that denies every tool. `opencode --version` picks the command line.
  *   - API: one chat-completions call to the selected provider (OpenRouter or an
  *     OpenAI-compatible endpoint), with the answer's schema when the step has one.
  *     No subprocess, so no local CLI is started and no Claude Code OAuth token is
@@ -32,17 +36,21 @@
  * through claude-mem's own validators.
  */
 
-import { randomBytes } from 'crypto';
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { randomBytes, randomUUID } from 'crypto';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'fs';
+import { homedir, tmpdir } from 'os';
 import { dirname, isAbsolute, join, relative, resolve } from 'path';
 import { query, type CanUseTool, type Options, type SdkPluginConfig } from '@anthropic-ai/claude-agent-sdk';
-import { buildIsolatedEnvWithFreshOAuth } from '../../shared/EnvManager.js';
+import { buildIsolatedEnvWithFreshOAuth, buildOpenCodeEnv } from '../../shared/EnvManager.js';
+import { stripJsonComments, stripUtf8Bom } from '../../shared/atomic-json.js';
 import { sanitizeEnv } from '../../supervisor/env-sanitizer.js';
 import { logger } from '../../utils/logger.js';
 import { runtimeReadRoots } from './runtime-read-roots.js';
-import { detectUsableAgents, GEMINI_NO_MCP_SERVERS, runCommand, type CommandResult, type UsableAgent, type UsableAgentId } from './detect.js';
+import { cutOutputText, detectUsableAgents, GEMINI_NO_MCP_SERVERS, runCommand, type CommandResult, type UsableAgent, type UsableAgentId } from './detect.js';
+import { isCmemGatewayUrl } from '../../shared/cmem-gateway.js';
+import type { ApiAgentLimits } from '../../shared/api-agent-limits.js';
 import { ApiProviderError, askApiTarget, resolveApiTarget } from './api-agent.js';
+import { WAITING_FOR_AGENT_REASON } from '../../shared/work-view-refresh-reasons.js';
 
 /** The model one step runs on: a Claude Code alias, a Codex model id (with reasoning effort) or a Gemini alias.
  * A missing entry or field leaves that CLI's own default. */
@@ -93,6 +101,8 @@ export interface AgentTask {
   /** Working directory for every backend (My Work's refresh: the work-view folder). */
   cwd: string;
   claudeCode: ClaudeCodeTaskOptions;
+  /** Request deadline and answer cap for this task's API agent. */
+  apiLimits?: ApiAgentLimits;
   /** Drives the agent step by step; returns a short result line. */
   run: (ask: AskAgent, agent: TaskAgentId) => Promise<string>;
   /** Input every backend reads, prepared once a logged-in agent is found (e.g. the owner's prompts file). */
@@ -126,12 +136,15 @@ export interface AgentRunnerDependencies {
   /** Environment for the agent process: the worker's isolated credentials, never tracked by claude-mem's own hooks.
    * Built fresh for every step: a run can outlive the OAuth access token it started with (Oct 22: the Mac slept
    * 11 hours mid-run, and the token injected at the start was revoked by the time the next step asked). */
-  buildEnv: () => Promise<NodeJS.ProcessEnv>;
+  buildEnv: (agent: TaskAgentId) => Promise<NodeJS.ProcessEnv>;
   /** Runtime platform, injectable so the Windows confinement gate is regression-testable. */
   platform: () => NodeJS.Platform;
+  /** The user's own OpenCode default model and custom providers, kept in an otherwise isolated run. */
+  opencodeUserConfig?: () => { model?: string; provider?: Record<string, unknown> };
 }
 
-async function defaultEnv(): Promise<NodeJS.ProcessEnv> {
+async function defaultEnv(agent: TaskAgentId): Promise<NodeJS.ProcessEnv> {
+  if (agent === 'opencode') return buildOpenCodeEnv();
   // CLAUDE_MEM_INTERNAL=1 keeps claude-mem's hooks from recording this run as
   // the owner's own work, so a refresh never makes itself due again.
   return { ...sanitizeEnv(await buildIsolatedEnvWithFreshOAuth()), CLAUDE_MEM_INTERNAL: '1' };
@@ -142,6 +155,7 @@ const defaultDependencies: AgentRunnerDependencies = {
   query,
   buildEnv: defaultEnv,
   platform: () => process.platform,
+  opencodeUserConfig: readOpenCodeUserConfig,
 };
 
 const describeError = (error: unknown) => (error instanceof Error ? error.message : String(error)).trim() || 'unknown error';
@@ -182,7 +196,7 @@ function claudeCodeAsk(agent: TaskAgent, task: AgentTask, dependencies: AgentRun
     return { behavior: 'deny', message: `${toolName} is not available to this read-only step.` };
   };
   return async (prompt, models) => {
-    const env = await dependencies.buildEnv();
+    const env = await dependencies.buildEnv(agent.id);
     let stderr = '';
     const options: Options = {
       pathToClaudeCodeExecutable: agent.path!,
@@ -240,8 +254,11 @@ function failure(name: string, result: CommandResult): Error {
  * `--ignore-user-config` skips that file, so the run has no MCP tools; auth
  * still comes from CODEX_HOME. Every save goes through the worker's validators.
  */
-const CODEX_EXEC_ARGS = (executable: string, cwd: string, answerPath: string, schemaPath: string | null, { model, reasoningEffort }: StepModel = {}) => [
-  'exec', '--strict-config', '-c', 'default_permissions="claude-mem-refresh"',
+const CODEX_EXEC_ARGS = (executable: string, cwd: string, answerPath: string, schemaPath: string | null, platform: NodeJS.Platform, { model, reasoningEffort }: StepModel = {}) => [
+  'exec', '--strict-config',
+  // The isolated launch ignores user config, including its Windows sandbox preference.
+  ...(platform === 'win32' ? ['-c', 'features.prefer_mxc=true'] : []),
+  '-c', 'default_permissions="claude-mem-refresh"',
   '-c', `permissions.claude-mem-refresh.filesystem={":root"="deny",":minimal"="read",":workspace_roots"={"."="read"},${runtimeReadRoots(executable).map(path => `${JSON.stringify(path)}="read"`).join(',')}}`,
   '-c', 'permissions.claude-mem-refresh.network.enabled=false', '--ephemeral', '--ignore-user-config', '--skip-git-repo-check', '-C', cwd, '-o', answerPath,
   ...(schemaPath ? ['--output-schema', schemaPath] : []), ...(model ? ['-m', model] : []), ...(reasoningEffort ? ['-c', `model_reasoning_effort="${reasoningEffort}"`] : []), '-',
@@ -285,7 +302,7 @@ export function codexModelForLogin(step: StepModel | undefined, env: NodeJS.Proc
 
 function codexAsk(agent: TaskAgent, task: AgentTask, dependencies: AgentRunnerDependencies): AskAgent {
   return async (prompt, models, answerSchema) => {
-    const env = await dependencies.buildEnv();
+    const env = await dependencies.buildEnv(agent.id);
     const directory = join(task.cwd, 'agent-runs');
     mkdirSync(directory, { recursive: true });
     const id = randomBytes(6).toString('hex');
@@ -298,17 +315,18 @@ function codexAsk(agent: TaskAgent, task: AgentTask, dependencies: AgentRunnerDe
       // macOS sandbox-exec must reopen the actual binary, not its PATH symlink.
       const executable = realPath(agent.path!);
       const model = codexModelForLogin(models.codex, env);
-      let result = await runCli(executable, CODEX_EXEC_ARGS(executable, task.cwd, answerPath, schemaPath, model), prompt, { cwd: task.cwd, env });
+      const platform = dependencies.platform();
+      let result = await runCli(executable, CODEX_EXEC_ARGS(executable, task.cwd, answerPath, schemaPath, platform, model), prompt, { cwd: task.cwd, env });
       // The models list can be missing or stale, so a login can still refuse the step's model. Then the
       // step runs once more on the login's default model instead of failing (Oct 25: gpt-6-luna).
       if (result.exitCode !== 0 && model?.model && CODEX_MODEL_REFUSED.test(`${result.stderr}\n${result.stdout}`)) {
         logger.warn('WORKER', `Codex refused ${model.model} for this login; retrying on its default model`);
-        result = await runCli(executable, CODEX_EXEC_ARGS(executable, task.cwd, answerPath, schemaPath, {}), prompt, { cwd: task.cwd, env });
+        result = await runCli(executable, CODEX_EXEC_ARGS(executable, task.cwd, answerPath, schemaPath, platform), prompt, { cwd: task.cwd, env });
       }
       if (result.exitCode !== 0) {
         // Recognize the actual capability refusal rather than disabling Codex
         // on every Windows machine: elevated/MXC installations may support it.
-        if (dependencies.platform() === 'win32'
+        if (platform === 'win32'
           && /unelevated restricted-token sandbox cannot enforce split filesystem read restrictions/i.test(`${result.stderr}\n${result.stdout}`)) {
           throw new Error('Codex refused this refresh because its Windows unelevated sandbox cannot enforce the required read restrictions. Use an administrator-provisioned elevated sandbox or a supported MXC sandbox. The existing provider fallback remains available; filesystem restrictions were preserved.');
         }
@@ -324,7 +342,7 @@ function codexAsk(agent: TaskAgent, task: AgentTask, dependencies: AgentRunnerDe
 
 function geminiAsk(agent: TaskAgent, task: AgentTask, dependencies: AgentRunnerDependencies): AskAgent {
   return async (prompt, models) => {
-    const env = await dependencies.buildEnv();
+    const env = await dependencies.buildEnv(agent.id);
     const model = models.gemini?.model;
     const policyDir = mkdtempSync(join(tmpdir(), 'claude-mem-gemini-policy-'));
     const policyPath = join(policyDir, 'settings.json');
@@ -344,12 +362,197 @@ function geminiAsk(agent: TaskAgent, task: AgentTask, dependencies: AgentRunnerD
       });
     } finally { rmSync(policyDir, { recursive: true, force: true }); }
     if (result.exitCode !== 0) throw failure('gemini', result);
+    // Part of the JSON is missing, so it cannot parse, and its parse error would blame the format instead of the cap.
+    if (result.stdoutTruncated) throw new Error(cutOutputText('gemini'));
     let output: { response?: unknown; error?: { message?: string } };
     try { output = JSON.parse(result.stdout); }
     catch { throw new Error(`gemini printed unreadable JSON: ${result.stdout.slice(0, 200)}`); }
     if (output.error) throw new Error(`gemini failed: ${output.error.message ?? 'unknown error'}`);
     if (typeof output.response !== 'string') throw new Error('gemini answered without a response.');
     return output.response;
+  };
+}
+
+/**
+ * The final assistant text of `opencode run --format json`: the CLI streams each
+ * text part as it arrives, so the answer is every part's text in order. An error
+ * event is reported even when the exit code is 0 (a cancelled session, for one).
+ */
+export function opencodeAnswer(stdout: string): string {
+  const texts: string[] = [];
+  for (const line of stdout.split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    let event: { type?: unknown; part?: { text?: unknown }; error?: { message?: unknown } };
+    try { event = JSON.parse(line); }
+    catch { continue; }
+    if (event.type === 'error') {
+      throw new Error(`opencode failed: ${typeof event.error?.message === 'string' ? event.error.message : 'unknown error'}`);
+    }
+    if (event.type === 'text' && typeof event.part?.text === 'string') texts.push(event.part.text);
+  }
+  const answer = texts.join('');
+  if (!answer.trim()) throw new Error('opencode answered without text.');
+  return answer;
+}
+
+/**
+ * The parts of the user's own OpenCode config an isolated run must keep: the
+ * default model (when no step pins one) and custom provider definitions, which
+ * may be the only place a provider the owner configured is described. Tools,
+ * plugins, MCP servers and agents are deliberately not carried over; the run's
+ * own config replaces those. An unreadable or absent config yields nothing, and
+ * the CLI then falls back to its own defaults as before.
+ */
+export function readOpenCodeUserConfig(): { model?: string; provider?: Record<string, unknown> } {
+  const configDirectory = join(process.env.XDG_CONFIG_HOME || join(homedir(), '.config'), 'opencode');
+  const candidates = [
+    process.env.OPENCODE_CONFIG,
+    join(configDirectory, 'opencode.json'),
+    join(configDirectory, 'opencode.jsonc'),
+  ].filter((path): path is string => typeof path === 'string' && path.length > 0);
+  for (const path of candidates) {
+    try {
+      if (!existsSync(path)) continue;
+      const parsed = JSON.parse(stripJsonComments(stripUtf8Bom(readFileSync(path, 'utf8')))) as Record<string, unknown>;
+      const model = typeof parsed.model === 'string' && parsed.model.trim() ? parsed.model : undefined;
+      const provider = parsed.provider && typeof parsed.provider === 'object' && !Array.isArray(parsed.provider)
+        ? parsed.provider as Record<string, unknown>
+        : undefined;
+      return { ...(model ? { model } : {}), ...(provider ? { provider } : {}) };
+    } catch { /* an unreadable user config must not fail the step */ }
+  }
+  return {};
+}
+
+/**
+ * The oldest OpenCode 2.x the refresh step runs on. OpenCode 2 has no `--pure`;
+ * the `plugin.use` policy is what keeps every external plugin out of the run, and
+ * its plugin loader first enforces that policy in v2.2.3
+ * (packages/core/src/plugin/module.ts). An older 2.x cannot run the step as
+ * isolated as 1.x does, so it is refused. Checked against the 2.2.3, 2.3.0 and
+ * 2.3.2 release binaries: a plugin in the config directory loads without the
+ * policy and never loads with it.
+ */
+const OPENCODE_2_MINIMUM_VERSION = [2, 2, 3] as const;
+
+const OPENCODE_REFRESH_AGENT = 'claude-mem-refresh';
+
+/**
+ * Which `opencode run` command line this CLI takes, from `opencode --version`
+ * (1.x prints `1.17.8`, 2.x prints `opencode v2.3.2`). Throws, so the step does
+ * not run, for a version whose isolation is not known.
+ */
+export function opencodeCliMajorVersion(versionOutput: string): 1 | 2 {
+  const match = /(?<![\d.])(\d+)\.(\d+)\.(\d+)(?![\d.])/.exec(versionOutput);
+  if (!match) throw new Error(`opencode --version printed no version (${versionOutput.trim().slice(0, 100) || 'nothing'}), so its run flags are unknown.`);
+  const version = [Number(match[1]), Number(match[2]), Number(match[3])];
+  if (version[0] === 1) return 1;
+  if (version[0] === 2) {
+    const [major, minor, patch] = OPENCODE_2_MINIMUM_VERSION;
+    const supported = version[1] > minor || (version[1] === minor && version[2] >= patch);
+    if (supported) return 2;
+    throw new Error(`OpenCode ${version.join('.')} cannot keep external plugins out of the refresh step; update OpenCode to ${major}.${minor}.${patch} or newer.`);
+  }
+  throw new Error(`OpenCode ${version.join('.')} is newer than the 1.x and 2.x releases claude-mem knows how to isolate, so the refresh step does not run on it.`);
+}
+
+/**
+ * `opencode run` for one step. 1.x: `--pure` drops external plugins and `--dir`
+ * pins the project to the isolated root. 2.x rejects both flags: `--standalone`
+ * starts a private server with this run's environment, where the background
+ * service would carry the user's own config, plugins and MCP servers, and the
+ * project directory is the working directory (PWD).
+ */
+function opencodeRunArgs(majorVersion: 1 | 2, configHome: string, model: string | undefined): string[] {
+  const isolation = majorVersion === 1 ? ['--pure', '--format', 'json', '--dir', configHome] : ['--standalone', '--format', 'json'];
+  return ['run', ...isolation, '--agent', OPENCODE_REFRESH_AGENT, ...(model ? ['--model', model] : [])];
+}
+
+/**
+ * One step through the OpenCode CLI, with the same read-only, evidence-inline
+ * boundary as Gemini: a temporary config root registers no MCP servers, and a
+ * primary agent denies every tool (`*`, which also covers tools a newer CLI
+ * adds), so the step can neither read the disk, write, run commands nor reach
+ * the web. External plugins (claude-mem's own among them) stay out: `--pure` on
+ * 1.x, the `plugin.use` policy on 2.x. The step runs from that config root, not
+ * the task folder, with project config discovery off: OpenCode merges a
+ * project's own `opencode.json`, which can add MCP servers, and on 1.x no config
+ * key can remove one later. The prompt goes on stdin: a refresh step's evidence
+ * can exceed the Windows argv limit, and `opencode run` reads a piped stdin as
+ * its message when no message is given.
+ */
+function opencodeAsk(agent: TaskAgent, _task: AgentTask, dependencies: AgentRunnerDependencies): AskAgent {
+  // One version check per run: every step of the run uses the same executable.
+  let majorVersion: Promise<1 | 2> | undefined;
+  const readMajorVersion = async (env: NodeJS.ProcessEnv) => {
+    const result = await runCli(agent.path!, ['--version'], '', { cwd: tmpdir(), env });
+    if (result.exitCode !== 0) throw failure('opencode --version', result);
+    return opencodeCliMajorVersion(result.stdout);
+  };
+  return async (prompt, models) => {
+    const env = await dependencies.buildEnv(agent.id);
+    majorVersion ??= readMajorVersion(env);
+    const cli = await majorVersion;
+    const model = models.opencode?.model;
+    const userConfig = (dependencies.opencodeUserConfig ?? readOpenCodeUserConfig)();
+    const configHome = mkdtempSync(join(tmpdir(), 'claude-mem-opencode-'));
+    const configDirectory = join(configHome, 'opencode');
+    mkdirSync(configDirectory, { recursive: true });
+    writeFileSync(join(configDirectory, 'opencode.json'), JSON.stringify({
+      $schema: 'https://opencode.ai/config.json',
+      // The owner's default model and providers survive; everything else below
+      // is the run's own boundary and overrides what the user configured.
+      ...(userConfig.model ? { model: userConfig.model } : {}),
+      ...(userConfig.provider ? { provider: userConfig.provider } : {}),
+      mcp: {},
+      permission: { edit: 'deny', bash: 'deny', webfetch: 'deny', external_directory: 'deny' },
+      // 2.x only (1.x has no policies). Policies from earlier-loaded config win, so
+      // only a managed or organization policy that allows a plugin outranks these.
+      ...(cli === 2 ? {
+        policies: [
+          { action: 'plugin.use', resource: '*', effect: 'deny' },
+          { action: 'mcp.use', resource: '*', effect: 'deny' },
+        ],
+      } : {}),
+      agent: {
+        [OPENCODE_REFRESH_AGENT]: {
+          description: 'Read-only step for claude-mem My Work refresh (evidence is inline)',
+          mode: 'primary',
+          tools: {
+            bash: false, edit: false, write: false, patch: false, read: false, grep: false, glob: false,
+            list: false, webfetch: false, websearch: false, task: false, todoread: false, todowrite: false,
+            question: false,
+          },
+          // Last rule wins on both CLIs: every tool not named above, such as `skill`
+          // (1.x and 2.x) or 2.x's automation and worktree tools, is denied too.
+          permission: { '*': 'deny' },
+        },
+      },
+    }), { mode: 0o600 });
+    // Config handed in through the environment would load after this run's file and could re-allow tools.
+    const { OPENCODE_CONFIG_CONTENT: _userConfigContent, ...inheritedEnv } = env;
+    try {
+      const result = await runCli(agent.path!, opencodeRunArgs(cli, configHome, model), prompt, {
+        cwd: configHome,
+        // XDG_CONFIG_HOME selects the isolated config root on every platform OpenCode reads it from.
+        // The step also runs from that root with project config off, so a project opencode.json (which
+        // can add MCP servers) is never discovered, and the explicit config paths neutralize the user's own overrides.
+        env: {
+          ...inheritedEnv,
+          XDG_CONFIG_HOME: configHome,
+          PWD: configHome,
+          OPENCODE_CONFIG: join(configDirectory, 'opencode.json'),
+          OPENCODE_CONFIG_DIR: configDirectory,
+          OPENCODE_DISABLE_PROJECT_CONFIG: '1',
+        },
+      });
+      if (result.exitCode !== 0) throw failure('opencode', result);
+      // The event stream was cut, so whole events are missing from the middle:
+      // answering with the surviving ones would present a partial turn as the
+      // whole answer. Fail loudly instead of parsing what is left.
+      if (result.stdoutTruncated) throw new Error(cutOutputText('opencode'));
+      return opencodeAnswer(result.stdout);
+    } finally { rmSync(configHome, { recursive: true, force: true }); }
   };
 }
 
@@ -367,19 +570,33 @@ function apiAsk(agent: TaskAgent, task: AgentTask, dependencies: AgentRunnerDepe
   // review batches) report it without sending. The latch lives and dies with this
   // run: it is not stored, and the next run asks the provider afresh.
   let refused: ApiProviderError | null = null;
+  // Every step of one run is one conversation for a preset that routes by a
+  // session header, so its requests share a routing (and prompt-cache) id.
+  const sessionId = randomUUID();
   return async (prompt, models, answerSchema) => {
     if (refused) throw refused;
-    const resolution = resolveApiTarget();
+    const resolution = targetForTask(task);
     if (!resolution.target) {
       throw new Error(`The selected API provider cannot answer this step: ${resolution.reason}`);
     }
     try {
-      return await askApiTarget(resolution.target, prompt, { model: models.api?.model, answerSchema });
+      return await askApiTarget(resolution.target, prompt, { model: models.api?.model, answerSchema, sessionId, limits: task.apiLimits });
     } catch (error) {
       if (error instanceof ApiProviderError && [401, 402, 403, 429].includes(error.status)) refused = error;
       throw error;
     }
   };
+}
+
+const agentNames: Record<TaskAgentId, string> = { 'claude-code': 'Claude Code', codex: 'Codex', gemini: 'Gemini', opencode: 'OpenCode', api: 'the selected API provider' };
+
+
+function targetForTask(task: AgentTask): ReturnType<typeof resolveApiTarget> {
+  const target = resolveApiTarget();
+  if (task.reason === 'setup-scan' && isCmemGatewayUrl(target.target?.url)) {
+    return { target: null, reason: 'Hosted setup requires an upload choice.' };
+  }
+  return target;
 }
 
 /**
@@ -388,14 +605,12 @@ function apiAsk(agent: TaskAgent, task: AgentTask, dependencies: AgentRunnerDepe
  * when a run fails, not when the agent's answer was refused, and never when the task stays on its first agent. Never throws. With no logged-in agent it returns
  * `waiting-for-agent` and runs nothing.
  */
-const agentNames: Record<TaskAgentId, string> = { 'claude-code': 'Claude Code', codex: 'Codex', gemini: 'Gemini', api: 'the selected API provider' };
-
 export async function runAgentTask(task: AgentTask, overrides: Partial<AgentRunnerDependencies> = {}): Promise<AgentRunResult> {
   const autoApprovedFileTools = task.claudeCode.allowedTools.filter(tool => FILE_TOOLS.includes(tool));
   if (autoApprovedFileTools.length) throw new Error(`Agent task ${task.reason} auto-approves ${autoApprovedFileTools.join(', ')}, which would read anywhere on disk; name readableFolders instead.`);
   const dependencies = { ...defaultDependencies, ...overrides };
   if (task.allowedAgents?.length === 0) {
-    return { state: 'waiting-for-agent', agent: null, result: null, error: 'No agent is allowed to run this task.', attempts: [] };
+    return { state: 'waiting-for-agent', agent: null, result: null, error: WAITING_FOR_AGENT_REASON.noAgentAllowed, attempts: [] };
   }
   // The API agent is not a local CLI. Detecting one probes this machine's Claude Code, Codex and
   // Gemini installs, which an API-only task has no use for.
@@ -406,7 +621,7 @@ export async function runAgentTask(task: AgentTask, overrides: Partial<AgentRunn
     .filter(agent => !localAllowed || localAllowed.includes(agent.id));
   // The API provider is usable only when it is configured. When it is not, the agent is left out
   // entirely: the task waits for it, and it never falls back to a local CLI.
-  const api = wantsApi ? resolveApiTarget() : null;
+  const api = wantsApi ? targetForTask(task) : null;
   const apiAgent: TaskAgent | null = api?.target
     ? { id: 'api', path: null, authenticated: true, reason: `${api.target.provider}: ${api.target.url}` }
     : null;
@@ -420,7 +635,7 @@ export async function runAgentTask(task: AgentTask, overrides: Partial<AgentRunn
       ? `The selected API provider cannot run this task: ${api.reason}`
       : task.allowedAgents
         ? `None of the allowed agents (${task.allowedAgents.map(agent => agentNames[agent]).join(', ')}) is logged in on this computer.`
-        : 'No logged-in Claude Code, Codex or Gemini on this computer yet.';
+        : WAITING_FOR_AGENT_REASON.noLoggedInAgent;
     return { state: 'waiting-for-agent', agent: null, result: null, error, attempts: [] };
   }
   const attempts: AgentAttempt[] = [];
@@ -433,7 +648,7 @@ export async function runAgentTask(task: AgentTask, overrides: Partial<AgentRunn
   for (const agent of ordered) {
     logger.info('WORKER', `Agent run (${task.reason}) starting on ${agent.id}`);
     try {
-      const ask = { 'claude-code': claudeCodeAsk, codex: codexAsk, gemini: geminiAsk, api: apiAsk }[agent.id](agent, task, dependencies);
+      const ask = { 'claude-code': claudeCodeAsk, codex: codexAsk, gemini: geminiAsk, opencode: opencodeAsk, api: apiAsk }[agent.id](agent, task, dependencies);
       const result = await task.run(ask, agent.id);
       logger.info('WORKER', `Agent run (${task.reason}) finished on ${agent.id}`);
       return { state: 'ok', agent: agent.id, result: result.slice(0, 4000), error: null, attempts };

@@ -12,6 +12,7 @@
  * file, so they do not probe again.
  */
 import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'fs';
+import { randomUUID } from 'crypto';
 import { dirname, join } from 'path';
 import { resolveDataDir } from './paths.js';
 import { logger } from '../utils/logger.js';
@@ -31,7 +32,7 @@ function probePath(): string {
   return pathOverride ?? join(resolveDataDir(), CMEM_CAP_PROBE_FILENAME);
 }
 
-function readExhaustedAt(): number | null {
+export function cmemCapExhaustedAt(): number | null {
   const path = probePath();
   try {
     if (!existsSync(path)) return null;
@@ -45,7 +46,7 @@ function readExhaustedAt(): number | null {
 
 /** True when a gateway request may be sent. No file means the cap is not known spent. */
 export function cmemCapProbeAllowed(now = Date.now()): boolean {
-  const exhaustedAt = readExhaustedAt();
+  const exhaustedAt = cmemCapExhaustedAt();
   if (exhaustedAt === null) return true;
   return now - exhaustedAt >= CMEM_CAP_PROBE_INTERVAL_MS;
 }
@@ -55,9 +56,16 @@ export function noteCmemCapExhausted(now = Date.now()): void {
   const path = probePath();
   try {
     mkdirSync(dirname(path), { recursive: true });
-    const tmp = `${path}.${process.pid}.tmp`;
-    writeFileSync(tmp, JSON.stringify({ exhaustedAtMs: now } satisfies CapProbeFile));
-    renameSync(tmp, path);
+    const tmp = `${path}.${randomUUID()}.tmp`;
+    try {
+      writeFileSync(tmp, JSON.stringify({ exhaustedAtMs: now } satisfies CapProbeFile), { flag: 'wx' });
+      renameSync(tmp, path);
+    } catch (error) {
+      // A failed write or rename (Windows EPERM/EBUSY while the target is held)
+      // would otherwise leave this randomly named temp behind on every attempt.
+      try { unlinkSync(tmp); } catch { /* the temp may not exist */ }
+      throw error;
+    }
   } catch (error) {
     logger.warn('SESSION', 'cmem cap probe file could not be written', undefined, error instanceof Error ? error : new Error(String(error)));
   }

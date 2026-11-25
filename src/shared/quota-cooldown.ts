@@ -37,6 +37,7 @@
  */
 
 import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'fs';
+import { randomUUID } from 'crypto';
 import { dirname, join } from 'path';
 import { paths } from './paths.js';
 import { logger } from '../utils/logger.js';
@@ -174,10 +175,17 @@ function persistToDisk(filePath: string = defaultCooldownFilePath()): void {
       if (existsSync(filePath)) unlinkSync(filePath);
       return;
     }
-    const tmp = `${filePath}.${process.pid}.tmp`;
-    writeFileSync(tmp, JSON.stringify(rows, null, 2), 'utf-8');
-    // Atomic swap, so a reader never sees a half-written ledger.
-    renameSync(tmp, filePath);
+    const tmp = `${filePath}.${randomUUID()}.tmp`;
+    try {
+      writeFileSync(tmp, JSON.stringify(rows, null, 2), { encoding: 'utf-8', flag: 'wx' });
+      // Atomic swap, so a reader never sees a half-written ledger.
+      renameSync(tmp, filePath);
+    } catch (error) {
+      // A failed write or rename (Windows EPERM/EBUSY while the target is held)
+      // would otherwise leave this randomly named temp behind on every attempt.
+      try { unlinkSync(tmp); } catch { /* the temp may not exist */ }
+      throw error;
+    }
   } catch (err) {
     logger.warn('SESSION', 'Failed to write quota-cooldown file', { filePath }, err as Error);
   }
@@ -630,11 +638,12 @@ export function setQuotaFallbackResolver(resolver: QuotaFallbackResolver | null)
  *
  * When another provider is serving (a quota fallback), the mirror names it, so
  * the session-start notice says capture continues instead of saying it is
- * paused. The answer is recomputed on every arm and clear; between those
- * events it can go stale (a settings edit, a login change, a window elapsing
- * into a probe).
+ * paused. The answer is recomputed on every arm and clear, and on a Codex
+ * store, which clears no breaker of its own (ResponseProcessor's
+ * releaseQuotaBreaker); between those events it can go stale (a settings edit,
+ * a login change, a window elapsing into a probe).
  *
- * Exported for tests: the elapsed-window paths need a controllable clock, which
+ * Tests pass a clock: the elapsed-window paths need one they control, which
  * the internal callers (always "now") cannot supply. `cooldownMs` pins one
  * duration for every window, for tests only.
  */

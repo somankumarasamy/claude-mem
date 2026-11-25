@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, mock } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from 'bun:test';
 import { EventEmitter } from 'node:events';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -171,6 +171,24 @@ describe('the API corpus agent answers on the selected provider', () => {
     });
   });
 
+  it('keeps the corpus deadline and output cap when My Work has overrides', async () => {
+    await withSettings({
+      ...OPENROUTER_SETTINGS, CLAUDE_MEM_WORK_VIEW_API_TIMEOUT_MS: '1800000', CLAUDE_MEM_WORK_VIEW_MAX_OUTPUT_TOKENS: '100000',
+    }, async settingsPath => {
+      const fetchMock = fakeFetch([chatAnswer('the answer')]);
+      restoreFetch = fetchMock.restore;
+      const agent = new ApiCorpusAgent(createStore().store, 'openrouter', settingsPath);
+      const corpus = createCorpus();
+      await agent.prime(corpus);
+      const timer = spyOn(AbortSignal, 'timeout');
+      try {
+        await agent.query(corpus, 'which provider answers corpus questions?');
+        expect(timer.mock.calls).toEqual([[600_000]]);
+        expect(fetchMock.calls[0].body.max_tokens).toBe(16_000);
+      } finally { timer.mockRestore(); }
+    });
+  });
+
   it('answers a question from the corpus and sends only the matching observations', async () => {
     await withSettings(OPENROUTER_SETTINGS, async (settingsPath) => {
       const fetchMock = fakeFetch([chatAnswer('Corpus questions run on the selected provider.')]);
@@ -212,6 +230,14 @@ describe('the API corpus agent answers on the selected provider', () => {
       { name: 'equivalent composed Hangul prefixes', question: '가나', title: '가나다' },
       { name: 'existing ASCII prefixes', question: 'AUTH', title: 'Authentication' },
       { name: 'existing identifier and number tokens', question: 'API_v2', title: 'API_v2 update' },
+      { name: 'a two-Han-character query inside a Chinese title', question: '登录', title: '修复第三方登录超时' },
+      { name: 'a two-Han-character query inside a Japanese title', question: '設定', title: '新しい設定を保存した' },
+      { name: 'a hiragana query inside a Japanese title', question: 'あと', title: 'このあと確認した' },
+      { name: 'a two-katakana query inside a Japanese title', question: 'メモ', title: '共有メモを保存した' },
+      { name: 'a prolonged sound mark inside a Japanese term', question: 'サーバー', title: 'Older source', extra: { facts: ['ローカルサーバーを再起動した'] } },
+      { name: 'a mixed Han and kana substring', question: '設定を', title: '新しい設定を保存した' },
+      { name: 'a canonically equivalent kana substring', question: 'か\u3099め', title: '更新後のがめんを確認した' },
+      { name: 'a Han substring containing a supplementary character', question: '𠮷野', title: '地域の𠮷野店を調べた' },
     ];
 
     for (const testCase of cases) {
@@ -245,6 +271,55 @@ describe('the API corpus agent answers on the selected provider', () => {
         });
       });
     }
+
+    it('scores an exact Han word above an otherwise equal, newer substring match', async () => {
+      await withSettings(OPENROUTER_SETTINGS, async (settingsPath) => {
+        const fetchMock = fakeFetch([chatAnswer('Selected the matching evidence.')]);
+        restoreFetch = fetchMock.restore;
+        const { store } = createStore();
+        const agent = new ApiCorpusAgent(store, 'openrouter', settingsPath);
+        const corpus = createCorpus({ observations: [
+          createObservation(41, '設定'),
+          createObservation(42, '新しい設定を保存した'),
+          createObservation(43, 'Unrelated recent note'),
+        ] });
+        await agent.prime(corpus);
+
+        const result = await agent.query(corpus, '設定');
+
+        expect(result.observations_matching).toBe(2);
+        const prompt = String(fetchMock.calls[0].body.messages[1].content);
+        expect(prompt).toContain('(#41)');
+        expect(prompt).toContain('(#42)');
+        expect(prompt.indexOf('(#41)')).toBeLessThan(prompt.indexOf('(#42)'));
+        expect(prompt).not.toContain('(#43)');
+      });
+    });
+
+    it('does not add ASCII infix or single-character Han substring matches', async () => {
+      await withSettings(OPENROUTER_SETTINGS, async (settingsPath) => {
+        const fetchMock = fakeFetch([chatAnswer('Selected the matching evidence.')]);
+        restoreFetch = fetchMock.restore;
+        const { store } = createStore();
+        const agent = new ApiCorpusAgent(store, 'openrouter', settingsPath);
+        const corpus = createCorpus({ observations: [
+          createObservation(41, 'Authentication'),
+          createObservation(42, 'Retokenize'),
+          createObservation(43, '再設定した'),
+          createObservation(44, '地域の𠮷野店を調べた'),
+        ] });
+        await agent.prime(corpus);
+
+        const result = await agent.query(corpus, 'auth token 設 𠮷');
+
+        expect(result.observations_matching).toBe(1);
+        const prompt = String(fetchMock.calls[0].body.messages[1].content);
+        expect(prompt).toContain('(#41)');
+        expect(prompt).not.toContain('(#42)');
+        expect(prompt).not.toContain('(#43)');
+        expect(prompt).not.toContain('(#44)');
+      });
+    });
 
     it('keeps differently accented words distinct', async () => {
       await withSettings(OPENROUTER_SETTINGS, async (settingsPath) => {

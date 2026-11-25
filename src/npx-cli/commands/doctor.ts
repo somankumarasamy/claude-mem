@@ -47,9 +47,10 @@ import { findCodexExecutablePath, isCodexOnPath } from '../install/tool-path.js'
 import { getCredential } from '../../shared/EnvManager.js';
 import { buildKeyPool } from '../../shared/api-key-pool.js';
 import { resolveOpenAICompatPreset } from '../../shared/openai-compat-presets.js';
+import { findLegacyClaudeMemAlias, type LegacyClaudeMemAliasFile } from './uninstall.js';
 import { treeSitterCliBinaryPath } from '../../services/smart-file-read/tree-sitter-cli-provision.js';
 import { checkTreeSitterCliLoadable, resolveTreeSitterBinPathFor, TREE_SITTER_CLI_PATH_WORKAROUND } from '../../services/smart-file-read/tree-sitter-bin-path.js';
-import { resolveDataDir } from '../../shared/paths.js';
+import { DB_FILENAME, resolveDataDir } from '../../shared/paths.js';
 import { paths } from '../../shared/paths.js';
 import { findOrphanedChromaRoots, readProcessTablePosix } from '../../supervisor/orphan-chroma-sweep.js';
 import { isPidAlive } from '../../supervisor/process-registry.js';
@@ -188,26 +189,52 @@ function describeChromaExit(lastExit: NonNullable<ChromaCrashState['lastExit']>)
   return lastExit.signal ? `signal ${lastExit.signal}` : `exit code ${lastExit.code ?? 'unknown'}`;
 }
 
+/** The `health` block of the worker's loopback-only /api/admin/doctor. */
+export interface WorkerDoctorHealth {
+  chroma?: unknown;
+  dependencies?: WorkerDependencyHealthPayload;
+}
+
 /**
- * Warn rows from the worker's /api/admin/doctor `health.chroma` block. These
- * are optional: any failure yields no rows and never changes the worker's
- * own status.
+ * One read of /api/admin/doctor. `npx doctor` reads two blocks from it (Chroma
+ * and dependency health), so it fetches once here and hands the same payload to
+ * both helpers below, instead of paying the 3 s timeout twice when the worker
+ * answers /api/health but stalls on /api/admin/doctor. (A stopped worker never
+ * gets here: probeWorkerHealth fails first and the doctor skips both blocks.)
  */
-export async function probeChromaDiagnostics(workerUrl: string): Promise<CheckResult[]> {
+export async function fetchWorkerDoctorHealth(workerUrl: string): Promise<WorkerDoctorHealth | null> {
   try {
     const response = await fetch(`${workerUrl}/api/admin/doctor`, withWorkerAuth({
       signal: AbortSignal.timeout(3000),
     }, { readOnly: true }));
     if (!response.ok) {
-      return [];
+      return null;
     }
-    const diagnostics = await response.json() as { health?: { chroma?: unknown } };
-    const chroma = diagnostics?.health?.chroma;
+    const payload = await response.json() as { health?: WorkerDoctorHealth };
+    return payload?.health ?? null;
+  } catch {
+    // Diagnostics are optional and must not change worker health status.
+    return null;
+  }
+}
+
+/**
+ * Warn rows from the `health.chroma` block. These are optional: a missing or
+ * malformed payload yields no rows and never changes the worker's own status.
+ */
+export function chromaChecksFromDoctorHealth(health: WorkerDoctorHealth | null): CheckResult[] {
+  try {
+    const chroma = health?.chroma;
     return isChromaCrashState(chroma) ? chromaDiagnosticChecks(chroma) : [];
   } catch {
     // Diagnostics are optional and must not change worker health status.
     return [];
   }
+}
+
+/** Chroma warn rows, reading /api/admin/doctor in one request when called alone. */
+export async function probeChromaDiagnostics(workerUrl: string): Promise<CheckResult[]> {
+  return chromaChecksFromDoctorHealth(await fetchWorkerDoctorHealth(workerUrl));
 }
 
 /** Warn rows for the worker's Chroma child exits and prewarm breaker, if any. */
@@ -257,36 +284,56 @@ export interface WorkerDependencyHealthPayload {
 }
 
 /**
- * Warn rows from the worker's /api/admin/doctor `health.dependencies` block (#5359).
- * Reports degraded observation generator dependencies (such as missing Claude CLI
- * when CLAUDE_MEM_PROVIDER is claude, or missing Codex CLI) and offers installed
- * alternatives.
+ * Warn rows from the `health.dependencies` block (#5359): degraded observation
+ * generator dependencies (such as a missing Claude CLI when CLAUDE_MEM_PROVIDER
+ * is claude, or a missing Codex CLI), with installed alternatives offered.
  */
+export function dependencyChecksFromDoctorHealth(
+  health: WorkerDoctorHealth | null,
+  codexDetected: boolean = false,
+  codexOnPath: boolean = false,
+  codexPath?: string | null,
+): CheckResult[] {
+  try {
+    const deps = health?.dependencies;
+    if (!deps?.degraded || !Array.isArray(deps.statuses)) {
+      return [];
+    }
+    return workerDependencyChecks(deps.statuses, codexDetected, codexOnPath, codexPath);
+  } catch {
+    // Diagnostics are optional and must not change worker health status. A
+    // malformed dependencies block must not hide the Chroma rows either.
+    return [];
+  }
+}
+
+/** Dependency warn rows, reading /api/admin/doctor in one request when called alone. */
 export async function probeWorkerDependencies(
   workerUrl: string,
   codexDetected: boolean = false,
   codexOnPath: boolean = false,
   codexPath?: string | null,
 ): Promise<CheckResult[]> {
-  try {
-    const response = await fetch(`${workerUrl}/api/admin/doctor`, withWorkerAuth({
-      signal: AbortSignal.timeout(3000),
-    }, { readOnly: true }));
-    if (!response.ok) {
-      return [];
-    }
-    const diagnostics = await response.json() as {
-      health?: { dependencies?: WorkerDependencyHealthPayload };
-    };
-    const deps = diagnostics?.health?.dependencies;
-    if (!deps?.degraded || !Array.isArray(deps.statuses)) {
-      return [];
-    }
+  return dependencyChecksFromDoctorHealth(await fetchWorkerDoctorHealth(workerUrl), codexDetected, codexOnPath, codexPath);
+}
 
-    return workerDependencyChecks(deps.statuses, codexDetected, codexOnPath, codexPath);
-  } catch {
-    return [];
-  }
+/**
+ * Both /api/admin/doctor blocks from one request, in the order the command
+ * shows them. The doctor command calls this so a worker that answers
+ * /api/health but stalls on /api/admin/doctor costs a single 3 s timeout
+ * instead of one per block.
+ */
+export async function workerDoctorHealthChecks(
+  workerUrl: string,
+  codexDetected: boolean = false,
+  codexOnPath: boolean = false,
+  codexPath?: string | null,
+): Promise<{ chroma: CheckResult[]; dependencies: CheckResult[] }> {
+  const health = await fetchWorkerDoctorHealth(workerUrl);
+  return {
+    chroma: chromaChecksFromDoctorHealth(health),
+    dependencies: dependencyChecksFromDoctorHealth(health, codexDetected, codexOnPath, codexPath),
+  };
 }
 
 export function workerDependencyChecks(
@@ -354,6 +401,37 @@ async function probeChromaCensus(): Promise<CheckResult> {
 }
 
 const MISSING_DEPENDENCIES_SHOWN = 5;
+
+/**
+ * The "Legacy shell alias" row: a pre-12.4.7 `alias claude-mem=` in a shell rc
+ * beats PATH, so it shadows the launcher and roots the CLI in the marketplace
+ * clone (#6228). Doctor only reports it — `install`/`update` strip it.
+ * Exported for tests.
+ */
+export function legacyAliasCheck(aliasFiles: LegacyClaudeMemAliasFile[]): CheckResult {
+  const name = 'Legacy shell alias';
+  if (aliasFiles.length === 0) {
+    return { name, status: 'ok', detail: 'none', required: false };
+  }
+  // install strips only single-line definitions: deleting the first line of a
+  // multiline one would break the shell rc, so those are removed by hand.
+  const strippable = aliasFiles.filter((file) => !file.spansMultipleLines).map((file) => file.filePath);
+  const byHand = aliasFiles.filter((file) => file.spansMultipleLines).map((file) => file.filePath);
+  const fixes = [
+    ...(strippable.length > 0
+      ? [`run \`npx claude-mem install\` to remove it from ${strippable.join(', ')}`]
+      : []),
+    ...(byHand.length > 0
+      ? [`remove it by hand from ${byHand.join(', ')} (it spans multiple lines, so install leaves it alone)`]
+      : []),
+  ];
+  return {
+    name,
+    status: 'warn',
+    detail: `alias claude-mem= in ${aliasFiles.map((file) => file.filePath).join(', ')} shadows the launcher — ${fixes.join('; ')}, then open a new shell`,
+    required: false,
+  };
+}
 
 /** The "Plugin installed" row: root, version and dependency completeness. Exported for tests. */
 export function pluginRootCheck(resolution: PluginRootResolution | null): CheckResult {
@@ -1089,6 +1167,82 @@ export function observerProviderCheck(options: ObserverProviderCheckOptions): Ch
   };
 }
 
+// Why 256 MiB: the worker sets journal_size_limit to 4 MiB
+// (SQLITE_JOURNAL_SIZE_LIMIT_BYTES in src/services/sqlite/connection.ts, not
+// imported here because it pulls in bun:sqlite and doctor runs under Node) and
+// keeps SQLite's default autocheckpoint of 1000 pages x 4 KiB. Measured
+// 2026-11-23 on a 6.1 GB database under daily use: the WAL sits at 4.0 MiB.
+// 64x that steady state leaves room for one large transaction (an import, a
+// migration) and still flags checkpoints that have stopped completing.
+export const DATABASE_WAL_STEADY_STATE_BYTES = 4 * 1024 * 1024;
+const DATABASE_WAL_WARN_BYTES = 64 * DATABASE_WAL_STEADY_STATE_BYTES;
+
+function readableBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GiB`;
+}
+
+/**
+ * The database file and its WAL sidecars. Reads metadata only: the worker may
+ * hold the database open and doctor must never mutate or lock it. A WAL past
+ * the warn threshold means a checkpoint has not completed; that is also the
+ * state in which Windows refuses to rename the file or its directory, so the
+ * row names it before an upgrade rather than leaving it to a failed swap.
+ */
+export function databaseFileCheck(
+  databasePath: string = paths.database(),
+  walWarnBytes: number = DATABASE_WAL_WARN_BYTES,
+): CheckResult {
+  if (!existsSync(databasePath)) {
+    return {
+      name: 'Database',
+      status: 'ok',
+      detail: 'not created yet (the worker creates it on first start)',
+      required: false,
+    };
+  }
+
+  let databaseBytes: number;
+  try {
+    const stats = statSync(databasePath);
+    if (!stats.isFile()) {
+      return { name: 'Database', status: 'warn', detail: `${databasePath} is not a regular file`, required: false };
+    }
+    databaseBytes = stats.size;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return { name: 'Database', status: 'warn', detail: `cannot read ${databasePath}: ${message}`, required: false };
+  }
+
+  const walPath = `${databasePath}-wal`;
+  const shmPath = `${databasePath}-shm`;
+  let walBytes: number | null = null;
+  try {
+    // The worker may checkpoint and remove the WAL between the exists check
+    // and the stat; that is a normal moment, not a report failure.
+    if (existsSync(walPath)) walBytes = statSync(walPath).size;
+  } catch {
+    walBytes = null;
+  }
+  const shmPresent = existsSync(shmPath);
+
+  const parts = [`${readableBytes(databaseBytes)} database`];
+  if (walBytes !== null) parts.push(`${readableBytes(walBytes)} WAL`);
+  if (shmPresent) parts.push(walBytes === null ? 'SHM without WAL' : 'SHM present');
+
+  const walWarning = walBytes !== null && walBytes >= walWarnBytes;
+  return {
+    name: 'Database',
+    status: walWarning ? 'warn' : 'ok',
+    detail: walWarning
+      ? `${parts.join(', ')}; the WAL has not checkpointed (warn at ${readableBytes(walWarnBytes)})`
+      : parts.join(', '),
+    required: false,
+  };
+}
+
 export async function runDoctorCommand(): Promise<void> {
   const checks: CheckResult[] = [];
   const dataDir = resolveDataDir();
@@ -1106,12 +1260,19 @@ export async function runDoctorCommand(): Promise<void> {
     required: false,
   });
 
+  // 3. The local database and its WAL sidecars. Informational: the worker owns
+  // the file, and a large WAL is a checkpoint that has not run, not corruption.
+  checks.push(databaseFileCheck(join(dataDir, DB_FILENAME)));
+
   // 3. Plugin installed: the root the worker spawns from (the shared
   // resolveWorkerScript() oracle — cache, marketplace, or dev checkout), with
   // its version and dependency completeness.
   const pluginRoot = resolvePluginRoot();
   const installed = pluginRoot !== null;
   checks.push(pluginRootCheck(pluginRoot));
+
+  // 3a. A leftover pre-12.4.7 shell alias shadows the launcher (#6228).
+  checks.push(legacyAliasCheck(findLegacyClaudeMemAlias()));
 
   // 3b. tree-sitter CLI at that root: smart_search and smart_outline shell out
   // to it, and installs suppress the script that downloads it (#2910).
@@ -1194,8 +1355,11 @@ export async function runDoctorCommand(): Promise<void> {
     const worker = await probeWorkerHealth(workerUrl);
     workerStatus = worker.status;
     workerDetail = worker.detail;
-    chromaChecks = await probeChromaDiagnostics(worker.workerUrl);
-    dependencyChecks = await probeWorkerDependencies(worker.workerUrl, codexAvailable, codexOnPath, codexPath);
+    // One read of /api/admin/doctor feeds both blocks, so a worker that answers
+    // /api/health but stalls on /api/admin/doctor costs one 3 s timeout, not two.
+    const doctorChecks = await workerDoctorHealthChecks(worker.workerUrl, codexAvailable, codexOnPath, codexPath);
+    chromaChecks = doctorChecks.chroma;
+    dependencyChecks = doctorChecks.dependencies;
   } catch (error: unknown) {
     if (error instanceof InvalidWorkerUrlError) workerDetail = error.message;
     // otherwise leave as fail

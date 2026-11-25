@@ -332,6 +332,27 @@ export function __verdictMemorySizeForTests(): number {
 /** Tests only: exercise the memo's write/read paths without a KV binding. */
 export { writeVerdictMemory, readVerdictMemory };
 
+// The verify endpoint receives the caller's `Authorization: Bearer <token>`,
+// so it gets the same rule as the other deployment URLs: https, or http only
+// for a loopback host, with no query, fragment or credentials. A malformed
+// value is a configuration fault, never a URL to send a token to.
+const LOOPBACK_VERIFY_HOSTNAMES = new Set(["127.0.0.1", "localhost", "[::1]"]);
+
+function tokenVerifyUrl(raw: string): string | null {
+	const trimmed = raw.trim();
+	if (trimmed.length === 0) return null;
+	let parsed: URL;
+	try {
+		parsed = new URL(trimmed);
+	} catch {
+		return null;
+	}
+	const loopbackHttp = parsed.protocol === "http:" && LOOPBACK_VERIFY_HOSTNAMES.has(parsed.hostname);
+	if (parsed.protocol !== "https:" && !loopbackHttp) return null;
+	if (parsed.search !== "" || parsed.hash !== "" || parsed.username !== "" || parsed.password !== "") return null;
+	return `${parsed.origin}${parsed.pathname.replace(/\/+$/, "")}`;
+}
+
 export function defaultAuthDependencies(env: Env): AuthDependencies {
 	return {
 		async readCachedVerdict(cacheKey) {
@@ -509,10 +530,15 @@ export async function authenticateRequest(
 		}
 	}
 
+	const verifyUrl = tokenVerifyUrl(env.TOKEN_VERIFY_URL ?? "");
+	if (verifyUrl === null) {
+		return { ok: false, response: errorResponse(503, "TOKEN_VERIFY_URL is not a valid https endpoint") };
+	}
+
 	let verifyRes: Response;
 	try {
 		verifyRes = await dependencies.verifyToken(
-			new Request(env.TOKEN_VERIFY_URL, {
+			new Request(verifyUrl, {
 				method: "GET",
 				headers: {
 					Authorization: `Bearer ${token}`,
@@ -708,9 +734,23 @@ async function handleGetStatus(
 	}
 }
 
-function hasInternalCredential(request: Request, env: Env): boolean {
+/**
+ * The Authorization header is caller-controlled and gates every internal
+ * route, so compare it without leaking the secret through timing. Hashing
+ * both sides gives equal-length inputs, which crypto.subtle.timingSafeEqual
+ * requires (it throws on a length mismatch). Same shape as sync-api's
+ * hasInternalCredential, with Web Crypto because this Worker has no node:crypto.
+ */
+export async function hasInternalCredential(request: Request, env: Env): Promise<boolean> {
 	const secret = env.CMEM_INTERNAL_PROJECTOR_SECRET ?? "";
-	return secret.length > 0 && request.headers.get("Authorization") === `Bearer ${secret}`;
+	if (secret.length === 0) return false;
+	const header = request.headers.get("Authorization");
+	if (header === null) return false;
+	const [provided, expected] = await Promise.all([
+		crypto.subtle.digest("SHA-256", encoder.encode(header)),
+		crypto.subtle.digest("SHA-256", encoder.encode(`Bearer ${secret}`)),
+	]);
+	return crypto.subtle.timingSafeEqual(provided, expected);
 }
 
 function exactKeys(record: Record<string, unknown>, expected: string[]): boolean {
@@ -727,7 +767,7 @@ async function readInternalBody(request: Request): Promise<Record<string, unknow
 }
 
 async function handleMetadataRead(request: Request, env: Env): Promise<Response> {
-	if (!hasInternalCredential(request, env)) return errorResponse(401, "invalid internal credential");
+	if (!(await hasInternalCredential(request, env))) return errorResponse(401, "invalid internal credential");
 	const body = await readInternalBody(request);
 	if (
 		body === null
@@ -753,7 +793,7 @@ async function handleMetadataRead(request: Request, env: Env): Promise<Response>
  * deliberately NOT touched by a reset.
  */
 async function handleHubReset(request: Request, env: Env): Promise<Response> {
-	if (!hasInternalCredential(request, env)) return errorResponse(401, "invalid internal credential");
+	if (!(await hasInternalCredential(request, env))) return errorResponse(401, "invalid internal credential");
 	const body = await readInternalBody(request);
 	if (
 		body === null
@@ -773,7 +813,7 @@ async function handleHubReset(request: Request, env: Env): Promise<Response> {
 }
 
 async function handleDeviceRename(request: Request, env: Env): Promise<Response> {
-	if (!hasInternalCredential(request, env)) return errorResponse(401, "invalid internal credential");
+	if (!(await hasInternalCredential(request, env))) return errorResponse(401, "invalid internal credential");
 	const body = await readInternalBody(request);
 	if (
 		body === null
@@ -1201,8 +1241,7 @@ function decimalAtLeast(left: string, right: string): boolean {
 }
 
 async function handleRepairDrain(request: Request, env: Env): Promise<Response> {
-	const expected = `Bearer ${env.CMEM_INTERNAL_PROJECTOR_SECRET ?? ""}`;
-	if (!env.CMEM_INTERNAL_PROJECTOR_SECRET || request.headers.get("Authorization") !== expected) {
+	if (!(await hasInternalCredential(request, env))) {
 		return errorResponse(401, "invalid internal projector credential");
 	}
 	let body: unknown;

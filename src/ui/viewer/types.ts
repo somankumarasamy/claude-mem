@@ -1,3 +1,5 @@
+import type { OpenAICompatReasoningEffort } from '../provider-options.js';
+
 export interface Observation {
   id: number;
   memory_session_id: string;
@@ -94,6 +96,11 @@ export interface SessionCatalogEntry {
   project: string;
   platform_source: string;
   custom_title: string | null;
+  /**
+   * What the session was about: the request of its newest summary (GET /api/sessions, 16.0+). `null` when the
+   * session has no summary yet. Missing (undefined) from an older worker, so the row keeps its 15.x title (G19).
+   */
+  summary_title?: string | null;
   started_at_epoch: number;
   item_count: number;
 }
@@ -161,6 +168,7 @@ export interface Settings {
   CLAUDE_MEM_OPENAI_COMPAT_BASE_URL?: string;
   CLAUDE_MEM_OPENAI_COMPAT_MODEL?: string;
   CLAUDE_MEM_OPENAI_COMPAT_REASONING?: string;
+  CLAUDE_MEM_OPENAI_COMPAT_REASONING_EFFORT?: '' | OpenAICompatReasoningEffort;
   CLAUDE_MEM_QUOTA_FALLBACK_PROVIDER?: string;
   CLAUDE_MEM_QUOTA_FALLBACK_MODEL?: string;
   CLAUDE_MEM_QUOTA_FALLBACK_AUTH_METHOD?: string;
@@ -183,6 +191,9 @@ export interface Settings {
   CLAUDE_CODE_PATH?: string;
   /** Written by `npx claude-mem teambrain join`; read-only here. Set once this install is in a team. */
   CLAUDE_MEM_TEAMBRAIN_URL?: string;
+  /** Read-only here. Older Cloud Sync installs may have a hub URL and no plan label. */
+  CLAUDE_MEM_PRO_PLAN?: string;
+  CLAUDE_MEM_CLOUD_SYNC_HUB_URL?: string;
 
   CLAUDE_MEM_BACKUP_ENABLED?: string;
   CLAUDE_MEM_BACKUP_INTERVAL_HOURS?: string;

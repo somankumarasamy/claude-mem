@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import { UnrecoverableError, type Job } from 'bullmq';
+import { DelayedError, UnrecoverableError, type Job } from 'bullmq';
 import { logger } from '../../utils/logger.js';
 import { PostgresAgentEventsRepository } from '../../storage/postgres/agent-events.js';
 import type { PostgresAgentEvent } from '../../storage/postgres/agent-events.js';
@@ -15,7 +15,7 @@ import {
   ServerGenerationJobPayloadValidationError,
   type ServerGenerationJobPayload,
 } from '../jobs/types.js';
-import { SERVER_MAX_PAID_SENDS_PER_JOB, ServerClassifiedProviderError, serverPaidSendOutcomeOf } from './providers/shared/error-classification.js';
+import { SERVER_MAX_PAID_SENDS_PER_JOB, SERVER_MAX_RETRY_AFTER_MS, ServerClassifiedProviderError, serverPaidSendOutcomeOf } from './providers/shared/error-classification.js';
 import type { ServerGenerationProvider, ServerGenerationResult } from './providers/shared/types.js';
 import {
   markGenerationFailed,
@@ -28,12 +28,16 @@ import { PostgresServerSessionsRepository } from '../../storage/postgres/server-
 // Phase 11 — sentinel exception class so the worker can distinguish
 // scope-violation/revoked-key failures from generic processor errors and
 // audit them under the right action. Marked non-retryable: an attacker who
-// tampered with a payload should never be retried into the queue.
-export class ServerGenerationScopeViolationError extends Error {
+// tampered with a payload should never be retried into the queue. BullMQ only
+// skips the remaining attempts for an UnrecoverableError, so a plain Error
+// here was delivered again and audited once per attempt.
+export class ServerGenerationScopeViolationError extends UnrecoverableError {
   readonly reason: 'scope_mismatch' | 'revoked_key';
   constructor(reason: 'scope_mismatch' | 'revoked_key', message: string) {
     super(message);
     this.reason = reason;
+    // BullMQ matches on the name as well; see the terminal outcome error below.
+    this.name = 'UnrecoverableError';
   }
 }
 
@@ -167,6 +171,9 @@ export class ProviderObservationGenerator {
    */
   async process(
     job: Job<ServerGenerationJobPayload>,
+    // The BullMQ worker's lock token for this delivery, which moving the job
+    // to delayed needs.
+    token?: string,
   ): Promise<{ jobId: string; status: 'completed' | 'superseded'; observationCount: number }> {
     const correlationId = `bullmq:${job.id ?? '?'}`;
     // Phase 12 — pivot id captured up front so every log line in this
@@ -312,7 +319,7 @@ export class ProviderObservationGenerator {
             resent: retryable,
           });
         }
-        await markGenerationFailed({
+        const movedTo = await markGenerationFailed({
           pool: this.options.pool,
           job: fresh,
           expectedAttempt: fresh,
@@ -321,6 +328,19 @@ export class ProviderObservationGenerator {
           retryable,
           ...(this.options.workerId !== undefined ? { workerId: this.options.workerId } : {}),
         });
+        // BullMQ redelivers a job that throws while it has attempts left. Once
+        // the row is `failed` that delivery finds it terminal in lockOutbox and
+        // returns normally, so BullMQ records the failed job as completed.
+        if (movedTo === 'failed') job.discard();
+        // A rate limit can say when the provider takes requests again. The
+        // queue's own backoff (5s, then 10s) does not read that, so a wait
+        // longer than 15s spent every attempt inside the window. Delay the
+        // job by the wait asked for; DelayedError tells BullMQ it was moved.
+        if (movedTo === 'queued' && classified?.retryAfterMs !== undefined) {
+          const delayMs = Math.min(classified.retryAfterMs, SERVER_MAX_RETRY_AFTER_MS);
+          await job.moveToDelayed(Date.now() + delayMs, token);
+          throw new DelayedError(`${classified.message}; retrying in ${delayMs}ms`);
+        }
       }
       throw error;
     }

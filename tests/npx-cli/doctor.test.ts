@@ -6,12 +6,16 @@ import { join } from 'path';
 import {
   autoUpdateCheck,
   bunRuntimeCheck,
+  databaseFileCheck,
+  DATABASE_WAL_STEADY_STATE_BYTES,
   hookLauncherCheck,
+  legacyAliasCheck,
   observerProviderCheck,
   probeChromaDiagnostics,
   probeWorkerDependencies,
   treeSitterCliCheck,
   workerDependencyChecks,
+  workerDoctorHealthChecks,
   type AutoUpdateDoctorSources,
 } from '../../src/npx-cli/commands/doctor.js';
 import { LAUNCHER_PROTOCOL } from '../../src/launcher/launcher-protocol.js';
@@ -239,6 +243,43 @@ describe('npx doctor Bun runtime', () => {
     expect(bunRuntimeCheck('v1.4.1', 'darwin')).toMatchObject({ status: 'ok', detail: 'v1.4.1' });
     expect(bunRuntimeCheck('1.4.0', 'linux').status).toBe('ok');
     expect(bunRuntimeCheck(null, 'darwin').status).toBe('fail');
+  });
+});
+
+describe('npx doctor legacy shell alias', () => {
+  it('is ok when no shell rc carries the alias', () => {
+    expect(legacyAliasCheck([])).toMatchObject({ name: 'Legacy shell alias', status: 'ok', required: false });
+  });
+
+  it('warns, names the files, and points at the command that strips the alias', () => {
+    const result = legacyAliasCheck([
+      { filePath: '/home/u/.bashrc', spansMultipleLines: false },
+      { filePath: '/home/u/.zshrc', spansMultipleLines: false },
+    ]);
+    expect(result.status).toBe('warn');
+    expect(result.required).toBe(false);
+    expect(result.detail).toContain('/home/u/.bashrc');
+    expect(result.detail).toContain('/home/u/.zshrc');
+    expect(result.detail).toContain('npx claude-mem install');
+  });
+
+  // install leaves a multiline definition alone (deleting its first line would
+  // break the shell rc), so pointing at install would never fix it.
+  it('tells the user to remove a multiline alias by hand, not to run install', () => {
+    const result = legacyAliasCheck([{ filePath: '/home/u/.bashrc', spansMultipleLines: true }]);
+    expect(result.status).toBe('warn');
+    expect(result.detail).toContain('/home/u/.bashrc');
+    expect(result.detail).toContain('by hand');
+    expect(result.detail).not.toContain('npx claude-mem install');
+  });
+
+  it('gives each file its own fix when only one alias spans multiple lines', () => {
+    const result = legacyAliasCheck([
+      { filePath: '/home/u/.bashrc', spansMultipleLines: true },
+      { filePath: '/home/u/.zshrc', spansMultipleLines: false },
+    ]);
+    expect(result.detail).toContain('run `npx claude-mem install` to remove it from /home/u/.zshrc');
+    expect(result.detail).toContain('remove it by hand from /home/u/.bashrc');
   });
 });
 
@@ -1124,5 +1165,105 @@ describe('npx doctor probeWorkerDependencies (#5359)', () => {
 
     fetchSpy?.mockImplementation(async () => { throw new Error('network down'); });
     expect(await probeWorkerDependencies(WORKER_URL, true)).toEqual([]);
+  });
+});
+
+describe('npx doctor single /api/admin/doctor read', () => {
+  beforeEach(() => {
+    requestedUrls = [];
+    fetchSpy = spyOn(globalThis, 'fetch');
+  });
+
+  afterEach(() => {
+    fetchSpy?.mockRestore();
+    fetchSpy = null;
+  });
+
+  it('reads both health blocks from one request', async () => {
+    fetchSpy?.mockImplementation(async (input: RequestInfo | URL) => {
+      requestedUrls.push(String(input));
+      return new Response(JSON.stringify({
+        health: {
+          chroma: chromaState(),
+          dependencies: { degraded: true, statuses: [{ dependency: 'claude_cli', kind: 'missing', message: 'not found' }] },
+        },
+      }), { status: 200 });
+    });
+
+    const checks = await workerDoctorHealthChecks(WORKER_URL, true, true);
+
+    expect(requestedUrls).toEqual([`${WORKER_URL}/api/admin/doctor`]);
+    expect(checks.chroma.some(row => row.name === 'Chroma child exits')).toBe(true);
+    expect(checks.dependencies.length).toBeGreaterThan(0);
+  });
+
+  it('keeps the Chroma rows when the dependencies block is malformed', async () => {
+    fetchSpy?.mockImplementation(async () => new Response(JSON.stringify({
+      health: {
+        chroma: chromaState(),
+        dependencies: { degraded: true, statuses: [null] },
+      },
+    }), { status: 200 }));
+
+    const checks = await workerDoctorHealthChecks(WORKER_URL, true, true);
+    expect(checks.chroma.some(row => row.name === 'Chroma child exits')).toBe(true);
+    expect(checks.dependencies).toEqual([]);
+
+    expect(await probeWorkerDependencies(WORKER_URL)).toEqual([]);
+  });
+});
+
+describe('databaseFileCheck', () => {
+  it('derives its steady-state WAL size from the worker journal_size_limit', async () => {
+    const { SQLITE_JOURNAL_SIZE_LIMIT_BYTES } = await import('../../src/services/sqlite/connection.js');
+    expect(DATABASE_WAL_STEADY_STATE_BYTES).toBe(SQLITE_JOURNAL_SIZE_LIMIT_BYTES);
+  });
+
+  let root: string;
+
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), 'cm-doctor-db-'));
+  });
+
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it('reports a database the worker has not created yet as informational', () => {
+    const row = databaseFileCheck(join(root, 'missing.db'));
+    expect(row.status).toBe('ok');
+    expect(row.detail).toContain('not created yet');
+  });
+
+  it('reports the database, its WAL and its SHM file', () => {
+    const db = join(root, 'claude-mem.db');
+    writeFileSync(db, Buffer.alloc(2048));
+    writeFileSync(`${db}-wal`, Buffer.alloc(1024));
+    writeFileSync(`${db}-shm`, Buffer.alloc(32));
+
+    const row = databaseFileCheck(db, 10 * 1024 * 1024);
+    expect(row.status).toBe('ok');
+    expect(row.detail).toContain('2.0 KiB database');
+    expect(row.detail).toContain('1.0 KiB WAL');
+    expect(row.detail).toContain('SHM present');
+  });
+
+  it('warns when the WAL is past the threshold', () => {
+    const db = join(root, 'claude-mem.db');
+    writeFileSync(db, Buffer.alloc(64));
+    writeFileSync(`${db}-wal`, Buffer.alloc(64));
+
+    const row = databaseFileCheck(db, 63);
+    expect(row.status).toBe('warn');
+    expect(row.detail).toContain('has not checkpointed');
+  });
+
+  it('names a lone SHM sidecar without a WAL', () => {
+    const db = join(root, 'claude-mem.db');
+    writeFileSync(db, Buffer.alloc(64));
+    writeFileSync(`${db}-shm`, Buffer.alloc(32));
+
+    const row = databaseFileCheck(db);
+    expect(row.detail).toContain('SHM without WAL');
   });
 });

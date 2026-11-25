@@ -36,6 +36,8 @@ import { SyncConflictRecovery, initializeConflictRecoverySchema } from '../src/s
 
 
 const SYNC_API_DIR = resolve(import.meta.dir, '../services/sync-api');
+/** The hosted My Work page's event stream is open: its Live chip says so (components/bits.tsx LiveIndicator). */
+const HOSTED_FEED_IS_LIVE = `document.querySelector('[data-live-chip]')?.dataset.connectionState === 'live'`;
 const SYNC_API_ENTRY = resolve(SYNC_API_DIR, 'src/index.ts');
 const USER_ID = `matrix-user-${crypto.randomUUID()}`;
 const TOKEN = `matrix-token-${crypto.randomUUID()}`;
@@ -563,9 +565,10 @@ async function runViewerMatrix(a: Device, b: Device, c: Device, viewers: MatrixV
   };
   const sessions = ['main', 'companion'].map(name => {
     const content = `matrix-view-${name}`, memory = `matrix-memory-${name}`;
-    const id = a.store.createSDKSession(content, 'matrix-view', name === 'main' ? 'Ship shared viewer' : 'Polish shared viewer', undefined, 'claude');
+    const privateOpening = name === 'main' ? 'Ship shared viewer' : 'Polish shared viewer';
+    const id = a.store.createSDKSession(content, 'matrix-view', privateOpening, undefined, 'claude');
     a.store.updateMemorySessionId(id, memory); a.store.saveUserPrompt(content, 1, `Matrix ${name} request`, id);
-    return { id, content, memory };
+    return { id, content, memory, privateOpening };
   });
   const fields = { task: 'Build shared viewer', status: 'doing' };
   const workId = a.store.appendWorkStateEntry({ project: 'matrix-view', listName: 'matrix-work', fields });
@@ -615,8 +618,16 @@ async function runViewerMatrix(a: Device, b: Device, c: Device, viewers: MatrixV
   const av = find(await local.snapshot()), bv = find(await middle.snapshot()), cv = find(await hosted.snapshot());
   check(av.progress.percent === 60 && cv.progress.percent === 60 && cv.conversationKeys.length === 2,
     'shared group membership and 60 percent progress converge');
-  check(av.contentFingerprint === cv.contentFingerprint && av.contentFingerprint === bv.contentFingerprint && av.sharedReviewDescriptor.fingerprint === cv.sharedReviewDescriptor.fingerprint,
-    'review fingerprints agree across distinct replica ids');
+  check([av, bv, cv].every(view => view.sharedReviewDescriptor.complete
+    && view.contentFingerprint === av.contentFingerprint && view.sharedReviewDescriptor.fingerprint === av.sharedReviewDescriptor.fingerprint),
+    'complete review fingerprints agree on the origin and both receiving replicas');
+  const detail = await hosted.request(`/api/work-view/requests/${encodeURIComponent(cv.id)}`);
+  const detailText = await detail.text();
+  check(detail.ok && detailText.includes('Matrix main request') && sessions.every(session => !detailText.includes(session.privateOpening)),
+    'hosted request detail discloses the live ask and omits private session openings');
+  check([b, c].every(device => sessions.every(session =>
+    count(device, 'SELECT COUNT(*) AS n FROM work_state_entries WHERE instr(fields, ?) > 0', session.privateOpening) === 0)),
+    'neither recipient stores the private openings in shared work metadata');
   check(cv.workProduct.some((product: any) => product.url === 'http://github.com/example/repo/pull/42'), 'published output provenance reaches hosted projection');
   check(count(c, 'SELECT COUNT(*) AS n FROM tool_uses') === 0, 'hosted projection requires no raw local tool bodies');
   const receivedWork = row<{ id: number }>(c, "SELECT id FROM work_state_entries WHERE origin_device_id=? AND origin_local_id=?", DEVICE_IDS.a, String(workId));
@@ -690,11 +701,13 @@ async function runViewerMatrix(a: Device, b: Device, c: Device, viewers: MatrixV
     console.log(`  POLLING_VISIBILITY ${JSON.stringify({ cadenceMs: 30_000, acceptedToVisibleMs: Math.round(visibleAfterMs), forcedPull: false, manualNotification: false })}`);
     for (const page of [pages.local, pages.hosted, pages.classic]) await page.evaluate('window.matrixNavigationSentinel = Math.random()');
     const sentinel = await pages.hosted.evaluate('window.matrixNavigationSentinel');
-    await browserWait(pages.hosted, `document.querySelector('[data-sync-state]')?.parentElement?.dataset.connectionState === 'live'`, 'hosted SSE live');
+    // My Work's Live chip carries the feed's own state (components/bits.tsx LiveIndicator, data-connection-state); the
+    // status line beside it carries the cloud copy's (data-sync-state). Read the chip itself, not a neighbour's parent.
+    await browserWait(pages.hosted, HOSTED_FEED_IS_LIVE, 'hosted SSE live');
     c.gate.pullsOnline = false;
     await c.client.pullOnce({ force: true }); await hosted.notify();
     await browserWait(pages.hosted, `document.querySelector('[data-sync-state="offline"]') !== null`, 'offline cloud status');
-    check(await pages.hosted.evaluate(`document.querySelector('[data-sync-state]')?.parentElement?.dataset.connectionState === 'live'`),
+    check(await pages.hosted.evaluate(HOSTED_FEED_IS_LIVE),
       'browser distinguishes an open SSE stream from an offline cloud pull');
     local.shared.saveFile(`progress/${groupId}.json`, progressEntry(80, 'Recovered progress after offline pull.'));
     const second = a.store.storeObservation(sessions[0].memory, 'matrix-view', observation('MATRIX_FEED_RECOVERED', 'Arrived without reload'), 2, 0);

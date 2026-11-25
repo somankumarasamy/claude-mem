@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import ts from 'typescript';
+import ts from 'typescript-compiler-api';
 import { LOCALE_NAMES, parseLocale, interpolate, placeholders } from '../src/ui/i18n/locale.ts';
 import { viewerZh } from '../src/ui/i18n/viewer-zh.ts';
 import { myworkZh } from '../src/ui/i18n/mywork-zh.ts';
@@ -14,6 +14,10 @@ import { myworkKo } from '../src/ui/i18n/mywork-ko.ts';
 import { setupKo } from '../src/ui/i18n/setup-ko.ts';
 import { settingsKo } from '../src/ui/i18n/settings-ko.ts';
 import { myworkTr } from '../src/ui/i18n/mywork-tr.ts';
+import { viewerPtBr } from '../src/ui/i18n/viewer-pt-BR.ts';
+import { myworkPtBr } from '../src/ui/i18n/mywork-pt-BR.ts';
+import { setupPtBr } from '../src/ui/i18n/setup-pt-BR.ts';
+import { settingsPtBr } from '../src/ui/i18n/settings-pt-BR.ts';
 import { viewerFr } from '../src/ui/i18n/viewer-fr.ts';
 import { myworkFr } from '../src/ui/i18n/mywork-fr.ts';
 import { setupFr } from '../src/ui/i18n/setup-fr.ts';
@@ -41,6 +45,39 @@ function literalTranslationKeys(directory: string): { path: string; key: string 
   return found;
 }
 
+/**
+ * The words a t() call picks with a ternary (or `??` / `||`) inside it, such as t(failed ? 'A' : 'B'), under
+ * `directory`: the check above sees only a string as the first argument, so these keys would go unchecked.
+ */
+function conditionalTranslationKeys(directory: string): { path: string; key: string }[] {
+  const found: { path: string; key: string }[] = [];
+  const literalsIn = (node: ts.Node, keys: string[]): void => {
+    if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) keys.push(node.text);
+    else if (ts.isConditionalExpression(node)) { literalsIn(node.whenTrue, keys); literalsIn(node.whenFalse, keys); }
+    else if (ts.isParenthesizedExpression(node)) literalsIn(node.expression, keys);
+    else if (ts.isBinaryExpression(node) && [ts.SyntaxKind.QuestionQuestionToken, ts.SyntaxKind.BarBarToken].includes(node.operatorToken.kind)) {
+      literalsIn(node.left, keys); literalsIn(node.right, keys);
+    }
+  };
+  for (const entry of readdirSync(directory, { withFileTypes: true })) {
+    const path = join(directory, entry.name);
+    if (entry.isDirectory()) { found.push(...conditionalTranslationKeys(path)); continue; }
+    if (!/\.tsx?$/.test(path) || path.includes('.test.')) continue;
+    const source = ts.createSourceFile(path, readFileSync(path, 'utf8'), ts.ScriptTarget.Latest, true);
+    function visit(node: ts.Node) {
+      if (ts.isCallExpression(node) && node.expression.getText(source) === 't'
+        && node.arguments.length && !ts.isStringLiteral(node.arguments[0])) {
+        const keys: string[] = [];
+        literalsIn(node.arguments[0], keys);
+        found.push(...keys.map(key => ({ path, key })));
+      }
+      ts.forEachChild(node, visit);
+    }
+    visit(source);
+  }
+  return found;
+}
+
 /** The literal t() calls under these folders of src/ui whose words `catalog` lacks, as "file: words". */
 function wordsMissingFrom(catalog: Record<string, string>, folders: string[]): string[] {
   return folders.flatMap(folder => literalTranslationKeys(join(UI_ROOT, folder)))
@@ -57,6 +94,8 @@ describe('UI language catalogs', () => {
     assert.equal(parseLocale('zh-CN'), 'zh-CN');
     assert.equal(parseLocale('ko'), 'ko');
     assert.equal(parseLocale('tr'), 'tr');
+    assert.equal(parseLocale('pt-BR'), 'pt-BR');
+    assert.equal(LOCALE_NAMES['pt-BR'], 'Português (Brasil)');
     assert.equal(parseLocale('toString'), 'en');
   });
 
@@ -69,6 +108,7 @@ describe('UI language catalogs', () => {
     viewerZh, myworkZh, setupZh, settingsZh,
     viewerKo, myworkKo, setupKo, settingsKo, myworkTr,
     viewerFr, myworkFr, setupFr, settingsFr,
+    viewerPtBr, myworkPtBr, setupPtBr, settingsPtBr,
   })) {
     it(`${name} has nonempty translations and preserves interpolation placeholders`, () => {
       assert.ok(Object.keys(catalog).length > 0);
@@ -84,6 +124,7 @@ describe('UI language catalogs', () => {
   for (const [name, localized, chinese] of [
     ['viewerKo', viewerKo, viewerZh], ['myworkKo', myworkKo, myworkZh], ['setupKo', setupKo, setupZh], ['settingsKo', settingsKo, settingsZh],
     ['viewerFr', viewerFr, viewerZh], ['myworkFr', myworkFr, myworkZh], ['setupFr', setupFr, setupZh], ['settingsFr', settingsFr, settingsZh],
+    ['viewerPtBr', viewerPtBr, viewerZh], ['myworkPtBr', myworkPtBr, myworkZh], ['setupPtBr', setupPtBr, setupZh], ['settingsPtBr', settingsPtBr, settingsZh],
   ] as const) {
     it(`${name} translates exactly the strings its Chinese catalog does`, () => {
       assert.deepEqual(Object.keys(localized).sort(), Object.keys(chinese).sort());
@@ -98,6 +139,13 @@ describe('UI language catalogs', () => {
     assert.deepEqual(wordsMissingFrom({ ...viewerZh, ...myworkZh, ...setupZh, ...settingsZh }, ['viewer', 'my-work/src']), []);
   });
 
+  // Setup's own screens only: My Work's pages still have such calls without entries (their track's to fix).
+  it('every word a setup t() call picks with a ternary has a catalog entry', () => {
+    const catalog = { ...viewerZh, ...myworkZh, ...setupZh, ...settingsZh };
+    assert.deepEqual(conditionalTranslationKeys(join(UI_ROOT, 'my-work/src/setup')).filter(({ key }) => !(key in catalog))
+      .map(({ path, key }) => `${path}: ${key}`), []);
+  });
+
   // Turkish reads the My Work catalog alone (core.ts), so words that only the setup or viewer catalogs carry, such as
   // 'Try again', show in English to a Turkish reader while the check above passes. My Work's setup flow has no Turkish
   // catalog, so only its pages and components are checked here.
@@ -109,6 +157,7 @@ describe('UI language catalogs', () => {
     [viewerZh, myworkZh, setupZh, settingsZh],
     [viewerKo, myworkKo, setupKo, settingsKo],
     [viewerFr, myworkFr, setupFr, settingsFr],
+    [viewerPtBr, myworkPtBr, setupPtBr, settingsPtBr],
   ]) {
     it('shared English phrases have the same translation across catalogs', () => {
       const seen = new Map<string, string>();

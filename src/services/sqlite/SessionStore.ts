@@ -4,6 +4,7 @@ import { createHash, randomUUID } from 'crypto';
 import { DATA_DIR, DB_PATH, ensurePrivateDir, OBSERVER_SESSIONS_PROJECT, USER_SETTINGS_PATH } from '../../shared/paths.js';
 import { logger } from '../../utils/logger.js';
 import type { ProjectKeySource } from '../../utils/project-name.js';
+import type { ProjectExclusionCatalog } from '../../shared/project-list.js';
 import { projectReadKeys, projectScopeSql, scopedProjects } from './project-read-keys.js';
 import {
   TableColumnInfo,
@@ -70,6 +71,7 @@ import {
   validateCanonicalMutation,
   type CanonicalMutation,
 } from '../sync/CanonicalContent.js';
+import { CONCEPT_ARRAY_JSON_SQL } from './concept-array-sql.js';
 
 // A Telegram send normally completes in seconds. A five-minute lease absorbs
 // a slow request while allowing a later SessionEnd delivery to recover work
@@ -212,12 +214,28 @@ export interface SessionCatalogRow {
   project: string;
   platform_source: string;
   custom_title: string | null;
+  /**
+   * What the session was about: the trimmed `request` of its newest summary (by created_at_epoch, then id) that
+   * has words. Null when the session has no such summary. The viewer titles a Sessions row with it.
+   */
+  summary_title: string | null;
   started_at_epoch: number;
   item_count: number;
 }
 
 const SESSION_CATALOG_DEFAULT_LIMIT = 200;
 const SESSION_CATALOG_MAX_LIMIT = 1000;
+
+/**
+ * The code points JavaScript's String.prototype.trim() removes (ECMAScript WhiteSpace and LineTerminator), as a
+ * SQLite char() call, so "a summary request with words" means the same in the catalog query and in the viewer.
+ * SQLite's one-argument TRIM() removes spaces only, so a request of "\n" would otherwise count as a title.
+ */
+const JS_TRIM_WHITESPACE_SQL = `char(${[
+  0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x20, 0xa0, 0x1680,
+  0x2000, 0x2001, 0x2002, 0x2003, 0x2004, 0x2005, 0x2006, 0x2007, 0x2008, 0x2009, 0x200a,
+  0x2028, 0x2029, 0x202f, 0x205f, 0x3000, 0xfeff,
+].join(', ')})`;
 
 /** #3038 near-duplicate dedup tables/columns. v50–55 are taken on main (v53: sdk_sessions.cwd, #3525; v54: FTS trigger scoping, #3284; v55: NOCASE project indexes, #3536). */
 const DEDUP_SCHEMA_VERSION = 56;
@@ -372,7 +390,7 @@ export class SessionStore {
       if (typeof filePath === 'string' && filePath.length > 0) paths.add(filePath);
     }
     if (paths.size === 0) return;
-    const insert = this.db.prepare(
+    const insert = this.cachedStatement(
       'INSERT OR IGNORE INTO observation_files(path, observation_id) VALUES (?, ?)',
     );
     for (const filePath of paths) insert.run(filePath, observationId);
@@ -2366,7 +2384,7 @@ export class SessionStore {
     toolUseIds: string[];
   }): void {
     if (!input.contentSessionId) throw new Error('Committed tool uses require a content session');
-    const insert = this.db.prepare(`
+    const insert = this.cachedStatement(`
       INSERT OR IGNORE INTO committed_observation_tool_uses
       (platform_source, content_session_id, tool_use_id, committed_at_epoch_ms)
       VALUES (?, ?, ?, ?)
@@ -3199,7 +3217,7 @@ export class SessionStore {
     return rows.map(row => row.project);
   }
 
-  getProjectCatalog(): {
+  getProjectCatalog(includeCheckoutPaths = false): Partial<ProjectExclusionCatalog> & {
     projects: string[];
     sources: string[];
     projectsBySource: Record<string, string[]>;
@@ -3208,17 +3226,19 @@ export class SessionStore {
       SELECT
         COALESCE(platform_source, '${DEFAULT_PLATFORM_SOURCE}') as platform_source,
         project,
+        ${includeCheckoutPaths ? 'cwd,' : ''}
         MAX(started_at_epoch) as latest_epoch
       FROM sdk_sessions
       WHERE project IS NOT NULL AND project != ''
         AND project != ?
-      GROUP BY COALESCE(platform_source, '${DEFAULT_PLATFORM_SOURCE}'), project
+      GROUP BY COALESCE(platform_source, '${DEFAULT_PLATFORM_SOURCE}'), project${includeCheckoutPaths ? ', cwd' : ''}
       ORDER BY latest_epoch DESC
-    `).all(OBSERVER_SESSIONS_PROJECT) as Array<{ platform_source: string; project: string; latest_epoch: number }>;
+    `).all(OBSERVER_SESSIONS_PROJECT) as Array<{ platform_source: string; project: string; cwd?: string | null }>;
 
     const projects: string[] = [];
     const seenProjects = new Set<string>();
     const projectsBySource = new Map<string, Set<string>>();
+    const checkoutPaths = new Map<string, Set<string>>();
 
     for (const row of rows) {
       const source = normalizePlatformSource(row.platform_source);
@@ -3226,6 +3246,12 @@ export class SessionStore {
       let sourceProjects = projectsBySource.get(source);
       if (!sourceProjects) projectsBySource.set(source, sourceProjects = new Set());
       sourceProjects.add(row.project);
+
+      if (row.cwd) {
+        let paths = checkoutPaths.get(row.project);
+        if (!paths) checkoutPaths.set(row.project, paths = new Set());
+        paths.add(row.cwd);
+      }
 
       if (!seenProjects.has(row.project)) {
         seenProjects.add(row.project);
@@ -3238,6 +3264,17 @@ export class SessionStore {
     return {
       projects,
       sources,
+      ...(includeCheckoutPaths && {
+        checkoutPathsByProject: Object.fromEntries([...checkoutPaths].map(([key, paths]) => [key, [...paths]])),
+        // A single adopted observation or summary is enough to read its source through the target.
+        projectMerges: this.db.query<ProjectExclusionCatalog['projectMerges'][number], []>(`
+          SELECT project AS source, merged_into_project AS target FROM observations
+          WHERE merged_into_project COLLATE NOCASE IS NOT NULL
+          UNION
+          SELECT project, merged_into_project FROM session_summaries
+          WHERE merged_into_project COLLATE NOCASE IS NOT NULL
+        `).all(),
+      }),
       projectsBySource: Object.fromEntries(
         sources.map(source => [source, [...(projectsBySource.get(source) ?? [])]])
       )
@@ -3247,9 +3284,11 @@ export class SessionStore {
   /**
    * Session catalog for the viewer's Sessions view: newest first, one row per
    * (platform_source, content_session_id), with the session's combined
-   * observation + summary + prompt count. Paged by `limit`/`offset` and
-   * filterable by project and platform so the payload stays small on large
-   * databases; `hasMore` says whether older sessions follow this page.
+   * observation + summary + prompt count and its newest summary's request as
+   * `summary_title`. Paged by `limit`/`offset` and filterable by project and
+   * platform so the payload stays small on large databases; `hasMore` says
+   * whether older sessions follow this page. Read-only: every per-session
+   * subquery is an index search, never a table scan or a sort.
    */
   getSessionCatalog(
     options: { project?: string; platformSource?: string; limit?: number; offset?: number } = {}
@@ -3262,6 +3301,24 @@ export class SessionStore {
         s.project,
         COALESCE(s.platform_source, '${DEFAULT_PLATFORM_SOURCE}') as platform_source,
         s.custom_title,
+        -- Newest summary with words: its time is the MAX among them, and id breaks a tie in the
+        -- index's own rowid order. Same result as ORDER BY created_at_epoch DESC, id DESC LIMIT 1,
+        -- without a per-session sort (the plan stays free of temp B-trees, which
+        -- tests/sqlite/session-catalog-recency.test.ts checks).
+        (
+          SELECT TRIM(ss.request, ${JS_TRIM_WHITESPACE_SQL})
+          FROM session_summaries ss
+          WHERE ss.memory_session_id = s.memory_session_id
+            AND TRIM(ss.request, ${JS_TRIM_WHITESPACE_SQL}) != ''
+            AND ss.created_at_epoch = (
+              SELECT MAX(newest.created_at_epoch)
+              FROM session_summaries newest
+              WHERE newest.memory_session_id = s.memory_session_id
+                AND TRIM(newest.request, ${JS_TRIM_WHITESPACE_SQL}) != ''
+            )
+          ORDER BY ss.id DESC
+          LIMIT 1
+        ) as summary_title,
         s.started_at_epoch,
         (
           (SELECT COUNT(*) FROM observations o WHERE o.memory_session_id = s.memory_session_id)
@@ -3323,7 +3380,11 @@ export class SessionStore {
   }
 
   getRecentSessionsWithStatus(project: string, limit: number = 3, platformSource?: string): RecentSessionStatusRow[] {
-    const params: any[] = [project];
+    // Adoption retains the session's original project. Use the same complete
+    // merge chains as search, without promoting a partially adopted source.
+    const readKeys = this.getProjectReadKeys([project]);
+    const scope = projectScopeSql('s', readKeys.length ? readKeys : [project], { includeMerged: false });
+    const params: any[] = [...scope.params];
     let platformClause = '';
     if (platformSource) {
       platformClause = `AND COALESCE(NULLIF(s.platform_source, ''), '${DEFAULT_PLATFORM_SOURCE}') = ?`;
@@ -3342,7 +3403,7 @@ export class SessionStore {
           EXISTS (SELECT 1 FROM session_summaries sum
             WHERE sum.memory_session_id = s.memory_session_id) as has_summary
         FROM sdk_sessions s
-        WHERE s.project COLLATE NOCASE = ? AND s.memory_session_id IS NOT NULL
+        WHERE ${scope.sql} AND s.memory_session_id IS NOT NULL
         ${platformClause}
         ORDER BY s.started_at_epoch DESC
         LIMIT ?
@@ -3479,8 +3540,9 @@ export class SessionStore {
     const orderClause = preserveIdOrder ? '' : `ORDER BY o.created_at_epoch ${direction}, o.id ${direction}`;
     const limitClause = limit && !preserveIdOrder ? 'LIMIT ?' : '';
 
-    const placeholders = ids.map(() => '?').join(',');
-    const params: any[] = [...ids];
+    // Corpus builds can select more rows than SQLite permits bind parameters.
+    // Keep one native ID membership query, with filters/order/limit applied once.
+    const params: any[] = [JSON.stringify(ids)];
     const additionalConditions: string[] = [];
 
     if (projects.length > 0) {
@@ -3507,13 +3569,9 @@ export class SessionStore {
 
     if (concepts) {
       const conceptsList = Array.isArray(concepts) ? concepts : [concepts];
-      // Match the keyword read: legacy concepts may be plain strings or JSON strings.
-      const conceptArray = `CASE WHEN json_valid(o.concepts) THEN CASE
-        WHEN json_type(o.concepts) = 'array' THEN o.concepts
-        WHEN json_type(o.concepts) = 'text' THEN json_array(json_extract(o.concepts, '$'))
-        ELSE json_array(o.concepts) END ELSE json_array(o.concepts) END`;
+      // Legacy concepts may be plain strings or JSON strings.
       const conceptConditions = conceptsList.map(() =>
-        `EXISTS (SELECT 1 FROM json_each(${conceptArray}) WHERE type = 'text' AND value = ?)`
+        `EXISTS (SELECT 1 FROM json_each(${CONCEPT_ARRAY_JSON_SQL}) WHERE type = 'text' AND value = ?)`
       );
       if (conceptConditions.length > 0) {
         params.push(...conceptsList);
@@ -3540,8 +3598,8 @@ export class SessionStore {
     }
 
     const whereClause = additionalConditions.length > 0
-      ? `WHERE o.id IN (${placeholders}) AND ${additionalConditions.join(' AND ')}`
-      : `WHERE o.id IN (${placeholders})`;
+      ? `WHERE o.id IN (SELECT value FROM json_each(?)) AND ${additionalConditions.join(' AND ')}`
+      : `WHERE o.id IN (SELECT value FROM json_each(?))`;
     if (limitClause) params.push(limit);
 
     const stmt = this.db.prepare(`
@@ -4121,11 +4179,13 @@ export class SessionStore {
         return { reason: 'recorded-by-hook', hookRowId: hookRow.id };
       }
     } else if (sessionDbId === undefined) {
+      // The tagged user_prompts row is the local source for this opening.
+      // Copying it onto the session loses its import origin during publication.
       const at = new Date(prompt.createdAtEpoch).toISOString();
       const inserted = this.db.prepare(`INSERT INTO sdk_sessions
         (content_session_id, memory_session_id, project, platform_source, user_prompt, started_at, started_at_epoch, completed_at, completed_at_epoch, status)
-        VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, 'completed')`)
-        .run(prompt.contentSessionId, prompt.project, platformSource, text, at, prompt.createdAtEpoch, at, prompt.createdAtEpoch);
+        VALUES (?, NULL, ?, ?, NULL, ?, ?, ?, ?, 'completed')`)
+        .run(prompt.contentSessionId, prompt.project, platformSource, at, prompt.createdAtEpoch, at, prompt.createdAtEpoch);
       sessionDbId = Number(inserted.lastInsertRowid);
     }
     const result = this.saveNativeUserPrompt(prompt.contentSessionId, sessionDbId, nativePromptId,
@@ -4229,9 +4289,14 @@ export class SessionStore {
     const statusFilter = '(? IS NULL OR c.status = ?) ';
     const order = 'ORDER BY c.score DESC, c.id DESC LIMIT ?';
     const statusArg = status ?? null;
+    // The count is bound as a SQL `LIMIT ?`, which takes neither a float
+    // ("datatype mismatch") nor a negative number (SQLite reads a negative LIMIT
+    // as "no limit"), so it is clamped here as well as rejected at the route:
+    // any caller reaches the same bounded read.
+    const boundLimit = Number.isFinite(limit) ? Math.max(1, Math.trunc(limit)) : 100;
     return project
-      ? this.db.prepare(`${select}WHERE c.project = ? AND ${statusFilter}${order}`).all(project, statusArg, statusArg, limit) as Row[]
-      : this.db.prepare(`${select}WHERE ${statusFilter}${order}`).all(statusArg, statusArg, limit) as Row[];
+      ? this.db.prepare(`${select}WHERE c.project = ? AND ${statusFilter}${order}`).all(project, statusArg, statusArg, boundLimit) as Row[]
+      : this.db.prepare(`${select}WHERE ${statusFilter}${order}`).all(statusArg, statusArg, boundLimit) as Row[];
   }
 
   // #3038 — record a reviewer's verdict on a candidate. `merged` is not accepted here:
@@ -4424,7 +4489,7 @@ export class SessionStore {
     // Context is platform-scoped, so Tier-0 must be too: a Codex observation
     // merged into a Claude row would vanish from Codex context.
     const sessionPlatform = normalizePlatformSource(
-      (this.db.prepare('SELECT platform_source FROM sdk_sessions WHERE memory_session_id = ? LIMIT 1')
+      (this.cachedStatement('SELECT platform_source FROM sdk_sessions WHERE memory_session_id = ? LIMIT 1')
         .get(memorySessionId) as { platform_source: string | null } | undefined)?.platform_source
     );
 
@@ -4433,7 +4498,7 @@ export class SessionStore {
       const mergedIntoExisting: boolean[] = [];
       const insertedObservationIds: number[] = [];
 
-      const obsStmt = this.db.prepare(`
+      const obsStmt = this.cachedStatement(`
         INSERT INTO observations
         (memory_session_id, project, type, title, subtitle, facts, narrative, concepts,
          files_read, files_modified, prompt_number, discovery_tokens, agent_type, agent_id, content_hash, created_at, created_at_epoch,
@@ -4442,7 +4507,7 @@ export class SessionStore {
         ON CONFLICT(memory_session_id, content_hash) DO NOTHING
         RETURNING id
       `);
-      const lookupExistingStmt = this.db.prepare(
+      const lookupExistingStmt = this.cachedStatement(
         'SELECT id, type, subtitle, facts, concepts FROM observations WHERE memory_session_id = ? AND content_hash = ?'
       );
       type ExistingObservation = ObservationDetails & { id: number };
@@ -4461,7 +4526,7 @@ export class SessionStore {
           const previousDetailsHash = computeObservationDetailsHash(previousHash, observation);
           // Both old hashes are ambiguous. Reuse only a complete content match,
           // never restore an old base hash that could select another variant.
-          const previous = (this.db.prepare(`SELECT id, type, subtitle, facts, concepts FROM observations
+          const previous = (this.cachedStatement(`SELECT id, type, subtitle, facts, concepts FROM observations
             WHERE memory_session_id = ? AND content_hash IN (?, ?)
               AND title IS ? AND COALESCE(narrative, '') = ?
             ORDER BY content_hash = ? DESC`)
@@ -4514,7 +4579,7 @@ export class SessionStore {
           // They still dedupe exact content, but must not collapse by title alone.
           const canonical = options.skipTitleDedup ? null : findTier0Canonical(this.db, project, titleNormKey, observation.title);
           if (canonical) {
-            this.db.prepare('UPDATE observations SET occurrence_count = occurrence_count + 1 WHERE id = ?').run(canonical.id);
+            this.cachedStatement('UPDATE observations SET occurrence_count = occurrence_count + 1 WHERE id = ?').run(canonical.id);
             reinforceObservation(this.db, canonical.id, reconfirmedOn);
             observationIds.push(canonical.id);
             mergedIntoExisting.push(true);
@@ -4587,7 +4652,7 @@ export class SessionStore {
         const filesEdited = summary.files_edited ?? rolledUp.files_edited;
 
         const existingSummary = promptNumber
-          ? (this.db.prepare(
+          ? (this.cachedStatement(
               `SELECT id, request, investigated, learned, completed, next_steps,
                       files_read, files_edited, notes, discovery_tokens, sync_rev
                FROM session_summaries
@@ -4623,7 +4688,7 @@ export class SessionStore {
           const mergedTokens = Math.max(existingSummary.discovery_tokens ?? 0, discoveryTokens);
           const nextRev = incrementCanonicalDecimal(existingSummary.sync_rev || '0');
 
-          this.db.prepare(`
+          this.cachedStatement(`
             UPDATE session_summaries SET
               request = ?, investigated = ?, learned = ?, completed = ?, next_steps = ?,
               files_read = ?, files_edited = ?, notes = ?, discovery_tokens = ?,
@@ -4658,7 +4723,7 @@ export class SessionStore {
           summaryId = existingSummary.id;
           summaryUpdated = true;
         } else {
-          const summaryStmt = this.db.prepare(`
+          const summaryStmt = this.cachedStatement(`
             INSERT INTO session_summaries
             (memory_session_id, project, request, investigated, learned, completed,
              next_steps, files_read, files_edited, notes, prompt_number, discovery_tokens, created_at, created_at_epoch)
@@ -4714,7 +4779,7 @@ export class SessionStore {
       // The assistant row may already have synced before the result corrects
       // its usage. Mark changed payloads for the existing CloudSync snapshotter,
       // which mints their next canonical revision against the acknowledged head.
-      const observationStmt = this.db.prepare(`UPDATE observations SET discovery_tokens = ?,
+      const observationStmt = this.cachedStatement(`UPDATE observations SET discovery_tokens = ?,
         synced_at = CASE WHEN discovery_tokens IS NOT ? THEN NULL ELSE synced_at END
         WHERE id = ? AND discovery_tokens IS NOT ? RETURNING project, merged_into_project`);
       for (const id of observationIds) {
@@ -4722,7 +4787,7 @@ export class SessionStore {
         for (const row of changed) for (const project of importedRowProjects(row)) projects.add(project);
       }
       if (summaryId !== null) {
-        this.db.prepare(`UPDATE session_summaries SET discovery_tokens = MAX(COALESCE(discovery_tokens, 0), ?),
+        this.cachedStatement(`UPDATE session_summaries SET discovery_tokens = MAX(COALESCE(discovery_tokens, 0), ?),
           synced_at = CASE WHEN COALESCE(discovery_tokens, 0) < ? THEN NULL ELSE synced_at END WHERE id = ?`)
           .run(discoveryTokens, discoveryTokens, summaryId);
       }
@@ -4745,8 +4810,7 @@ export class SessionStore {
     const direction = orderBy === 'date_asc' ? 'ASC' : 'DESC';
     const orderClause = preserveIdOrder ? '' : `ORDER BY ss.created_at_epoch ${direction}, ss.id ${direction}`;
     const limitClause = limit && !preserveIdOrder ? 'LIMIT ?' : '';
-    const placeholders = ids.map(() => '?').join(',');
-    const params: any[] = [...ids];
+    const params: any[] = [JSON.stringify(ids)];
     const additionalConditions: string[] = [];
 
     if (projects.length > 0) {
@@ -4769,7 +4833,7 @@ export class SessionStore {
       SELECT ss.*
       FROM session_summaries ss
       LEFT JOIN sdk_sessions s ON s.memory_session_id = ss.memory_session_id
-      WHERE ss.id IN (${placeholders}) ${additionalFilter}
+      WHERE ss.id IN (SELECT value FROM json_each(?)) ${additionalFilter}
       ${orderClause}
       ${limitClause}
     `);
@@ -4795,8 +4859,7 @@ export class SessionStore {
     const direction = orderBy === 'date_asc' ? 'ASC' : 'DESC';
     const orderClause = preserveIdOrder ? '' : `ORDER BY up.created_at_epoch ${direction}, up.id ${direction}`;
     const limitClause = limit && !preserveIdOrder ? 'LIMIT ?' : '';
-    const placeholders = ids.map(() => '?').join(',');
-    const params: any[] = [...ids];
+    const params: any[] = [JSON.stringify(ids)];
     const additionalConditions: string[] = [];
 
     if (projects.length > 0) {
@@ -4823,7 +4886,7 @@ export class SessionStore {
         COALESCE(NULLIF(s.platform_source, ''), '${DEFAULT_PLATFORM_SOURCE}') as platform_source
       FROM user_prompts up
       JOIN sdk_sessions s ON up.session_db_id = s.id
-      WHERE up.id IN (${placeholders}) ${additionalFilter}
+      WHERE up.id IN (SELECT value FROM json_each(?)) ${additionalFilter}
       ${orderClause}
       ${limitClause}
     `);
@@ -5168,14 +5231,26 @@ export class SessionStore {
     }).immediate();
   }
 
+  /**
+   * Finalize the cached hot-path statements while leaving a shared connection
+   * open. A manager that owns the database closes it itself and never calls
+   * `close()`, so it has to finalize these first: bun keeps the connection,
+   * its WAL index mapping and the database file alive until every statement is
+   * finalized or collected. On Windows the file or its directory cannot be
+   * renamed or removed before then.
+   */
+  finalizeCachedStatements(): void {
+    for (const statement of this.statementCache.values()) statement.finalize();
+    this.statementCache.clear();
+  }
+
   close(): void {
     // bun keeps a prepared statement — and with it the connection, its WAL index mapping and the
     // database file — alive until the statement is finalized or collected, so a plain `db.close()`
     // releases nothing while this store still holds its cache. Finalize the cached statements first,
     // the way initializeOwnedDatabase does; then close strict, which Windows needs before the file
     // or its directory can be renamed or removed.
-    for (const statement of this.statementCache.values()) statement.finalize();
-    this.statementCache.clear();
+    this.finalizeCachedStatements();
     try {
       this.db.close(true);
     } catch (error) {
@@ -5194,7 +5269,9 @@ export class SessionStore {
    * requeuePromptSync bumps and enqueues once per prompt of a session on every
    * registration. A fresh `prepare()` per call made a native statement that
    * lived until GC finalized it, and on long sessions they piled up until
-   * prepare() itself ran out of memory (#3537). bun's own `db.query()` cache is
+   * prepare() itself ran out of memory (#3537). storeObservations and
+   * updateDiscoveryTokens run once per observer turn, so their statements are
+   * cached too. bun's own `db.query()` cache is
    * shared by every caller on the connection and bounded
    * (Database.MAX_QUERY_CACHE_SIZE, 20 by default), so whether a statement
    * stays cached there depends on what else ran.
@@ -5456,6 +5533,20 @@ export class SessionStore {
       );
       const id = result.lastInsertRowid as number;
       replaceObservationFileIndex(this.db, id, obs.files_read, obs.files_modified);
+      // Restore derived lookup data too, without merging historical rows.
+      // Read SQLite's saved title (legacy imports can have numeric/boolean
+      // values) and the actual local parent, not an exported platform hint.
+      const saved = this.db.prepare(`SELECT o.title, o.agent_id, o.agent_type, s.platform_source
+        FROM observations o LEFT JOIN sdk_sessions s ON s.memory_session_id = o.memory_session_id
+        WHERE o.id = ?`).get(id) as {
+          title: string | null; agent_id: string | null; agent_type: string | null; platform_source: string | null;
+        };
+      this.db.prepare('UPDATE observations SET title_norm_key = ? WHERE id = ?').run(
+        computeTitleNormKey(obs.project, saved.platform_source, saved.title,
+          isSubagentEvent(saved.agent_id, saved.agent_type)), id,
+      );
+      const dedup = this.dedupConfig();
+      if (dedup.enabled) this.maintainDedupOnInsert(obs.project, id, saved.title, dedup);
       return id;
     })();
     emitContextInvalidation({ projects: importedRowProjects(obs) }, 'importObservation');

@@ -10,6 +10,7 @@ import type { CodexProvider } from '../CodexProvider.js';
 import type { SessionCompletionHandler } from './SessionCompletionHandler.js';
 import {
   recordCmemFallbackIfEligible,
+  regularProviderAfterCmemCap,
   releaseCmemGatewayProbe,
   routeAroundUnservableProvider,
   type SelectableProvider,
@@ -25,7 +26,7 @@ import {
 } from './response-pacer.js';
 import { telemetryBuffer } from '../../telemetry/buffer.js';
 import { observerUsageLogFields } from '../observer-usage.js';
-import { AMBIGUOUS_QUOTA_MESSAGE, recordObserverFailure, type ObserverQuotaReason } from '../../../shared/observer-health.js';
+import { AMBIGUOUS_QUOTA_MESSAGE, CLAUDE_LOGIN_UNREADABLE_CODE, recordObserverFailure, type ObserverQuotaReason } from '../../../shared/observer-health.js';
 import { explainQuotaAbort, globalRateLimitStore } from '../RateLimitStore.js';
 import {
   CODEX_CLI_SETUP_REMEDIATION,
@@ -41,6 +42,7 @@ import {
   QUOTA_EXHAUSTED_RECHECK_COOLDOWN_MS,
 } from '../../../shared/quota-cooldown.js';
 import {
+  CmemAllowanceExhaustedError,
   CODEX_COOLDOWN_REFUSAL_CODE,
   DEADLINE_EXCEEDED_CODE,
   isClassified,
@@ -293,15 +295,25 @@ export async function startGeneratorWithProvider(
       // ledger nor given a breaker (a 30-min breaker over the marker's 15-min
       // window would leave memory on neither), and the finally resumes it.
       if (provider === 'openrouter' && recordCmemFallbackIfEligible(error, gatewayProbeClaimId)) {
-        // Moving the buffered work to the Anthropic plan is itself an
-        // unattended retry, so it draws on the gateway's unattended budget —
-        // a fallback only ever happens with memory on the gateway.
-        if (planUnattendedGatewayResume(session, 'cmem-fallback', true).resume) {
+        // A real HTTP 402 allowance refusal performed no inference. Hand the
+        // still-live batch to the configured provider once, with its original
+        // age and paid-send budget. Never hand off an ambiguous prior send,
+        // an authentication failure, or a failed probe.
+        const budget = session.paidSendBudget;
+        const unspent = budget ? budget.spentPaidSends === 0 : !session.consecutiveUnattendedGatewayResumes;
+        if (classified instanceof CmemAllowanceExhaustedError && unspent
+          && normalizeAbortReason(session.abortReason) === 'quota'
+          && regularProviderAfterCmemCap(session.platformSource) !== null
+          && planUnattendedGatewayResume(session, 'cmem-cap-fallback', true).resume) {
+          session.abortReason = 'provider_switch:cmem_cap';
+          scheduledResume = { afterMs: 0, source: 'cmem-cap-fallback' };
+        } else if (gatewayProbeClaimId !== null && !['auth', 'quota'].includes(normalizeAbortReason(session.abortReason))
+          && planUnattendedGatewayResume(session, 'cmem-fallback', true).resume) {
           scheduledResume = { afterMs: 0, source: 'cmem-fallback' };
         }
         // The gateway's words and request id, which its copy asks users to
         // quote to support.
-        logger.warn('SESSION', 'cmem gateway is not serving this account; memory runs on the Anthropic plan provider', {
+        logger.warn('SESSION', 'cmem gateway is not serving this account; local provider routing will check availability', {
           sessionId: session.sessionDbId,
           ...(classified ? { kind: classified.kind } : {}),
           ...(classified?.code ? { code: classified.code } : {}),
@@ -468,8 +480,17 @@ export async function startGeneratorWithProvider(
       // waiting out the failure threshold and then offering a restart. The same
       // prose appears when the worker cannot read a credential that exists
       // (#5250), so the notice names that as the next check after /login.
+      // When the spawn already knew it had found no usable login (#6319),
+      // the notice says that, with the item it read, instead: /login cannot
+      // help a user whose terminal is already signed in to another profile.
+      const unreadableLoginReason = session.unusableClaudeLoginReason ?? null;
       if (reason === 'auth:observer_text' && provider === 'claude' && !failureBooked) {
-        recordObserverFailure(provider, {
+        recordObserverFailure(provider, unreadableLoginReason ? {
+          message: `claude-mem could not read your Claude Code login: ${unreadableLoginReason}`,
+          kind: 'auth_invalid',
+          code: CLAUDE_LOGIN_UNREADABLE_CODE,
+          action: 'If `claude auth status` says you are logged out, run /login. If it says you are logged in, your terminal uses another credential profile (CLAUDE_CONFIG_DIR / CLAUDE_SECURESTORAGE_CONFIG_DIR): run `claude setup-token` and put the token in ~/.claude-mem/.env as CLAUDE_CODE_OAUTH_TOKEN',
+        } : {
           message: 'Claude Code could not authenticate the observer',
           kind: 'auth_invalid',
           action: 'Run /login in Claude Code (or `claude auth login` in a terminal) to refresh the observer credentials. If you are already signed in, check the worker log for OAUTH credential-store lookup errors',

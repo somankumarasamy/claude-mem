@@ -71,23 +71,48 @@ class ServerRuntimeInfoRoutes implements RouteHandler {
     // can read waiting/active/completed/failed/delayed/stalled without
     // hitting `/api/health`. Sampling is best-effort: a Redis blip surfaces
     // the lane with `unavailable: true` rather than crashing the route.
+    //
+    // It is unauthenticated on purpose (a probe cannot present credentials) and
+    // the server runtime is reachable over the container network
+    // (docker-compose sets CLAUDE_MEM_SERVER_HOST=0.0.0.0). So it reports the
+    // state the route documents and nothing else: the auth mode, the Postgres
+    // schema version, the queue backend's connection coordinates (host, port,
+    // key prefix) and the raw driver error text were reconnaissance for anyone
+    // who could reach the port, and a probe reads the lanes without them.
+    // `vectorSearch` keeps its documented shape (available, model, missing
+    // count, last embedding error).
     app.get('/v1/info', async (_req, res) => {
-      const queueLanes = await collectQueueLaneMetrics(this.graph);
-      const vectorSearch = await getVectorSearchStatus(this.graph.postgres.pool).catch((error: unknown) => ({
-        unavailable: true,
-        error: error instanceof Error ? error.message : String(error),
-      }));
+      // The lanes' `unavailable` flag is probe state; the failure reason is the
+      // driver's raw error text (host, port, topology), which this route's own
+      // comment above calls reconnaissance. /api/health strips the same field
+      // from its lanes for exactly that reason, so the cause stays in the log
+      // the manager already wrote and this response keeps the flag only. The
+      // loopback-only doctor route keeps the reason: its consumer reads it for
+      // the remediation row.
+      const queueLanes = (await collectQueueLaneMetrics(this.graph)).map(
+        ({ unavailableReason: _unavailableReason, ...lane }) => lane,
+      );
+      const vectorSearch = await getVectorSearchStatus(this.graph.postgres.pool).catch((error: unknown) => {
+        // The response stays free of the driver error text (see above); the
+        // cause goes to the server log, where the operator can read it.
+        const err = error instanceof Error ? error : new Error(String(error));
+        logger.warn('SYSTEM', 'Vector search status could not be read for /v1/info', {}, err);
+        return {
+          available: false,
+          model: '',
+          observationsWithoutVectors: null,
+          lastEmbedError: null,
+        };
+      });
       res.json({
         name: 'claude-mem-server',
         runtime: SERVER_RUNTIME,
-        authMode: this.graph.authMode,
         postgres: {
           initialized: this.graph.postgres.bootstrap.initialized,
-          schemaVersion: this.graph.postgres.bootstrap.schemaVersion,
         },
         boundaries: {
-          queueManager: this.graph.queueManager.getHealth(),
-          generationWorkerManager: this.graph.generationWorkerManager.getHealth(),
+          queueManager: { status: this.graph.queueManager.getHealth().status },
+          generationWorkerManager: { status: this.graph.generationWorkerManager.getHealth().status },
         },
         queueLanes,
         vectorSearch,

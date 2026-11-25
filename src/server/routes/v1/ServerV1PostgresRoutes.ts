@@ -47,7 +47,7 @@ import { PostgresServerSessionsRepository, type PostgresServerSession } from '..
 import { IngestEventsService, type EnqueueOutcome } from '../../services/IngestEventsService.js';
 import { EndSessionService } from '../../services/EndSessionService.js';
 import { normalizePlatformSource, normalizePlatformSourceOrNull } from '../../../shared/platform-source.js';
-import { LISTING_OFFSET_CAP_MESSAGE, MAX_LISTING_OFFSET } from '../../../shared/listing-offset-cap.js';
+import { listingOffsetCapMessage, MAX_LISTING_OFFSET } from '../../../shared/listing-offset-cap.js';
 import {
   SERVER_CONTEXT_MAX_LIMIT,
   SERVER_CONTEXT_QUERY_DEFAULT_LIMIT,
@@ -171,6 +171,15 @@ function responseWaitSignal(res: Response): { signal: AbortSignal; dispose: () =
       socket?.off('close', onClose);
     },
   };
+}
+
+// SQLSTATE class 22 (data exception: bad encoding, value out of range, invalid
+// text representation...) means the row can never be stored as sent. Answer 4xx
+// so the hook spool quarantines it, instead of a 500 it replays on every hook
+// for the whole retry window.
+export function isPostgresDataException(error: unknown): boolean {
+  const code = (error as { code?: unknown } | null)?.code;
+  return typeof code === 'string' && code.startsWith('22');
 }
 
 export class ServerV1PostgresRoutes implements RouteHandler {
@@ -1672,6 +1681,11 @@ export class ServerV1PostgresRoutes implements RouteHandler {
       res.status(403).json({ error: 'Forbidden', message });
       return;
     }
+    if (isPostgresDataException(error)) {
+      logger.warn('SYSTEM', `${action} rejected: invalid data`, { error: message, code: (error as { code: string }).code });
+      res.status(400).json({ error: 'InvalidData', message });
+      return;
+    }
     logger.error('SYSTEM', `${action} failed`, { error: message });
     res.status(500).json({ error: 'InternalError', message: 'Failed to persist event' });
   }
@@ -2164,9 +2178,10 @@ export function parseJobListingQuery(req: Request): {
 
 function parseJobListOffset(value: unknown): number {
   const offset = clampInt(value, 0, 0, Number.MAX_SAFE_INTEGER);
-  if (offset > JOB_LIST_MAX_OFFSET) {
+  const listingCap = listingOffsetCapMessage(offset, JOB_LIST_MAX_OFFSET);
+  if (listingCap !== null) {
     throw new AppError(
-      LISTING_OFFSET_CAP_MESSAGE,
+      listingCap,
       400,
       'INVALID_PAGINATION',
     );

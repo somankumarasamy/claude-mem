@@ -1,4 +1,5 @@
 """Real bundled Node CLI + disposable bundled worker; vendor HTTP is synthetic."""
+from contextlib import closing
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import hashlib
 import json
@@ -84,7 +85,7 @@ class Vendor(BaseHTTPRequestHandler):
             assert body == {'filters': {'user_id': 'fixture-user'}, 'show_expired': False}
             user = 'wrong-user' if mode == 'wrong-user' else 'fixture-user'
             row = dict(id='m1', memory='Mem0 imported synthetic saffron lighthouse.', user_id=user,
-                       created_at='2026-01-01T00:00:00Z', metadata={'original': True})
+                       created_at='2026-01-01T00:00:00Z', lifecycle_state=None, metadata={'original': True})
             value = {'count': 3, 'next': None, 'previous': None, 'results': [row,
                      dict(row, id='m2', expiration_date='2020-01-01'), dict(row, id='m3', replaced_by='m1')]}
         elif parsed.path.endswith('/list/documents'):
@@ -150,7 +151,9 @@ with tempfile.TemporaryDirectory(prefix='provider import ') as directory:
         return json.load(urlopen(request, timeout=5))
 
     def rows():
-        with sqlite3.connect(root/'claude-mem.db') as db:
+        # The connection context manager only handles transactions. Close the reader
+        # now so SQLite cannot remove its WAL sidecars later during the final scan.
+        with closing(sqlite3.connect(root/'claude-mem.db')) as db:
             return db.execute('SELECT id, project, narrative, metadata FROM observations ORDER BY id').fetchall()
 
     def save_document_as_15_19_0():

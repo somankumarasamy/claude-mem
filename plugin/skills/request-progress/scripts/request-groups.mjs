@@ -260,7 +260,7 @@ function writeBufferAtomic(filepath, payload, options = {}) {
   }
   let fd;
   try {
-    fd = mode !== void 0 ? openSync(tmpPath, "w", mode) : openSync(tmpPath, "w");
+    fd = mode !== void 0 ? openSync(tmpPath, "wx", mode) : openSync(tmpPath, "wx");
     if (mode !== void 0 && !IS_WINDOWS_PLATFORM) fchmodSync(fd, mode);
     let written = 0;
     while (written < payload.length) {
@@ -855,6 +855,15 @@ ${err.stack ?? ""}
   }
 });
 
+// src/shared/api-agent-limits.ts
+var DEFAULT_API_AGENT_LIMITS;
+var init_api_agent_limits = __esm({
+  "src/shared/api-agent-limits.ts"() {
+    "use strict";
+    DEFAULT_API_AGENT_LIMITS = { timeoutMs: 6e5, maxOutputTokens: 16e3 };
+  }
+});
+
 // src/shared/openrouter-base-url.ts
 function isHttpUrl(value) {
   try {
@@ -968,6 +977,7 @@ var init_SettingsDefaultsManager = __esm({
   "src/shared/SettingsDefaultsManager.ts"() {
     "use strict";
     init_hook_constants();
+    init_api_agent_limits();
     init_atomic_json();
     init_openrouter_base_url();
     init_settings_document();
@@ -1123,12 +1133,13 @@ var init_SettingsDefaultsManager = __esm({
         // OpenAI-compatible base URL, e.g. https://integrate.api.nvidia.com/v1. Overrides the preset's base URL when set.
         CLAUDE_MEM_OPENAI_COMPAT_MODEL: "",
         // Model id passed verbatim. Empty = the preset's default model.
+        CLAUDE_MEM_OPENAI_COMPAT_REASONING_EFFORT: "",
         CLAUDE_MEM_OPENAI_COMPAT_REASONING: "",
         // off | on. Empty = off: every openai-compatible request sends reasoning:{enabled:false}. "on" leaves reasoning to the endpoint.
         CLAUDE_MEM_OPENAI_COMPAT_OBSERVATION_BATCH_SIZE: "1",
         // Queued same-context events per observer prompt (1-32); opt-in.
         CLAUDE_MEM_QUOTA_FALLBACK_PROVIDER: "claude",
-        // 'claude' (the Anthropic plan; '' means this too) | 'gemini' | 'openrouter' | 'openai-compatible' | 'off': where observer work goes while the selected provider cannot serve (spent allowance, rate limit or over capacity past its retries, outage, repeated unusable replies). Claude is used only when a Claude login or key exists
+        // 'claude' (the Anthropic plan; '' means this too) | 'codex' (the local Codex CLI's ChatGPT login) | 'gemini' | 'openrouter' | 'openai-compatible' | 'off': where observer work goes while the selected provider cannot serve (spent allowance, rate limit or over capacity past its retries, outage, repeated unusable replies). Claude is used only when a Claude login or key exists; Codex only when a ChatGPT login exists. Values: QUOTA_FALLBACK_OPTIONS in src/ui/provider-options.ts
         CLAUDE_MEM_QUOTA_FALLBACK_MODEL: "",
         // Claude model for a Claude fallback run; '' = CLAUDE_MEM_MODEL and tier routing. Ignored for other fallbacks (only ClaudeProvider reads modelOverride)
         CLAUDE_MEM_QUOTA_FALLBACK_AUTH_METHOD: "",
@@ -1169,9 +1180,9 @@ var init_SettingsDefaultsManager = __esm({
         CLAUDE_MEM_WORK_STATE_ENABLED: "true",
         // 'false' = no work-state section at SessionStart and no work_state_* MCP tools, for hosts that track work their own way
         CLAUDE_MEM_AUTO_CLEAR_ENABLED: "false",
-        // Claude Code mod (plugin/hooks/auto-clear.js): at CLAUDE_MEM_AUTO_CLEAR_PERCENT of the context window, Claude saves its work state, then /clear runs and "continue" is sent. Off unless set to 'true'. Needs work state on
-        CLAUDE_MEM_AUTO_CLEAR_PERCENT: "33",
-        // Context window use (1-95) that starts the auto-clear
+        // Claude Code mod (src/mods/auto-clear, in plugin/hooks/hooks-module.js): at CLAUDE_MEM_AUTO_CLEAR_PERCENT of the context window, Claude saves its work state, then /clear runs and a continuation prompt built from that save is sent ("continue" when the save left its blanks out). Off unless set to 'true'. Needs work state on
+        CLAUDE_MEM_AUTO_CLEAR_PERCENT: "40",
+        // Context window use (1-95) that starts the auto-clear. 40: the maintainer's choice (raised from 33 on 2026-11-17); src/mods/auto-clear/settings.ts keeps the same value
         CLAUDE_MEM_FILE_READ_GATE_ENABLED: "true",
         // 'false' = never block a full-file Read; the file's observation timeline is still added as context
         CLAUDE_MEM_LINE_ANCHORS_ENABLED: "false",
@@ -1252,6 +1263,12 @@ var init_SettingsDefaultsManager = __esm({
         // Chroma embedding/index writes can exceed the MCP SDK's 60s default
         CLAUDE_MEM_CHROMA_MAX_PENDING_MUTATIONS: "5000",
         // Bound burst imports without changing normal live indexing
+        CLAUDE_MEM_CHROMA_BACKFILL_PAUSE_RATIO: "1",
+        // Bulk backfill sleeps (row write time x ratio) after each row: 1 = at most ~50% duty, 0 = off, max 10. Live sync is never paced
+        CLAUDE_MEM_CHROMA_PROCESS_NICE: "10",
+        // chroma-mcp starts as `nice -n N uvx ...` where `nice` exists (not Windows). 0 = off, max 19
+        CLAUDE_MEM_CHROMA_MAX_THREADS: "0",
+        // Opt-in cap on chroma-mcp's embedding threads and Linux CPU affinity (`taskset`). 0 = off: 39f110260 removed an always-on cap that slowed backfill. 2 suits machines where chroma-mcp pins cores (#6365)
         // Embedding function used when creating the Chroma collection. 'default' is
         // the local all-MiniLM-L6-v2 (English-tuned). The pinned chroma-mcp also
         // accepts 'openai', 'cohere', 'jina', 'voyageai' and 'roboflow'; those are
@@ -1269,7 +1286,10 @@ var init_SettingsDefaultsManager = __esm({
         // current model (search by meaning just turned on, or the model changed)
         // embeds them in the background, which can take hours on a large store.
         // That start caps the embedder at this many CPU threads until the next
-        // restart: empty is half the machine's threads, 0 is every thread.
+        // restart: empty is half the machine's threads, 0 is every thread. This
+        // applies to the hosted server only: local Chroma uses
+        // CLAUDE_MEM_CHROMA_MAX_THREADS, CLAUDE_MEM_CHROMA_PROCESS_NICE, and
+        // CLAUDE_MEM_CHROMA_BACKFILL_PAUSE_RATIO.
         CLAUDE_MEM_EMBEDDING_BACKFILL_THREADS: "",
         // Embedding model the server's search by meaning uses: a key of
         // EMBEDDING_MODELS in src/services/vector/models.ts, which lists them and
@@ -1311,14 +1331,10 @@ var init_SettingsDefaultsManager = __esm({
         // Streamed request idle window (streamed-chat-completion.ts): silence that ends a stream. Self-hosted backends queue behind a load balancer, and the queue wait reads as idle (#4737) — raise it there. Literal because shared cannot import from the worker; a drift test pins it to the shipped constant
         CLAUDE_MEM_WORKER_HEARTBEAT_STALE_MS: "120000",
         // A silent worker whose liveness heartbeat is younger than this is slow, not dead (10000-3600000).
-        // Observation TV remote broadcast. EMPTY = OFF: the read-only guard is not
-        // mounted and the worker behaves exactly as before. Set (with a non-loopback
-        // CLAUDE_MEM_WORKER_HOST) to expose ONLY /tv, /tv.html, /stream and
-        // GET /api/observations to holders of this secret. Mint with:
-        //   node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))"
-        CLAUDE_MEM_TV_TOKEN: "",
         CLAUDE_MEM_LOCAL_API_TOKEN: "",
         // Local API token. Empty = off. See the declaration above.
+        CLAUDE_MEM_LOCAL_API_TOKEN_REMOTE_HOST: "",
+        // The one remote worker that may receive it. Empty = loopback only.
         // claude-mem sign-in funnel state: all empty until the installer's
         // browser-login step writes them.
         CLAUDE_MEM_PRO_TRIAL_EMAIL: "",
@@ -1355,24 +1371,30 @@ var init_SettingsDefaultsManager = __esm({
         // 'false' = My Work never runs owner-goals / request-progress on its own (refresh.json in ~/.claude-mem/work-view)
         CLAUDE_MEM_WORK_VIEW_REFRESH_INTERVAL_MIN: "10",
         // Minutes between My Work's scheduled checks (each is a read-only database look; an agent runs only when something is due). 1440 = once a day. Read when the worker starts.
-        CLAUDE_MEM_WORK_VIEW_SHARED_STATE: "false",
-        // Enable only after all local/cloud readers understand reserved My Work records.
+        CLAUDE_MEM_WORK_VIEW_SHARED_STATE: "",
+        // Off until explicitly configured. A pinned 'false' remains an opt-out.
         CLAUDE_MEM_WORK_VIEW_COPY_PROVIDER: "",
         // '' uses OpenRouter only when it is the primary provider; openrouter/openai-compatible explicitly select that provider; off disables generated My Work copy
         CLAUDE_MEM_WORK_VIEW_COPY_MODEL: "",
         // Optional model override for generated My Work copy; empty uses the selected provider's configured model
         CLAUDE_MEM_WORK_VIEW_AGENT: "",
-        // Which agent runs the My Work refresh: '' follows CLAUDE_MEM_PROVIDER and stays on one agent; claude-code/codex/gemini pick one; off runs none; all falls through every logged-in agent (#5189)
+        // Which agent runs the My Work refresh: '' follows CLAUDE_MEM_PROVIDER and stays on one agent; claude-code/codex/gemini/opencode pick one; off runs none; all falls through every logged-in agent (#5189)
         CLAUDE_MEM_WORK_VIEW_CLAUDE_MODEL: "",
         // #5164 — model for every My Work refresh step on Claude Code (an alias like 'haiku'); empty keeps haiku/sonnet per step
         CLAUDE_MEM_WORK_VIEW_CODEX_MODEL: "",
         // #5164 — same for Codex; empty keeps the per-step table
         CLAUDE_MEM_WORK_VIEW_GEMINI_MODEL: "",
         // #5164 — same for Gemini; empty keeps flash-lite/flash per step
+        CLAUDE_MEM_WORK_VIEW_OPENCODE_MODEL: "",
+        // #5535 — model for every My Work refresh step on OpenCode ('provider/model'); empty uses OpenCode's configured default
         CLAUDE_MEM_WORK_VIEW_API_MODEL: "",
         // Model for every My Work refresh step on the selected API provider; empty keeps the provider's configured model
+        CLAUDE_MEM_WORK_VIEW_API_TIMEOUT_MS: String(DEFAULT_API_AGENT_LIMITS.timeoutMs),
+        CLAUDE_MEM_WORK_VIEW_MAX_OUTPUT_TOKENS: String(DEFAULT_API_AGENT_LIMITS.maxOutputTokens),
         CLAUDE_MEM_CORPUS_AGENT: "",
         // Which agent answers knowledge-corpus prime/query/reprime: '' uses the Claude Agent SDK (the Claude subscription); 'api' answers over chat completions on the selected openrouter/openai-compatible provider and spends that provider's credit
+        CLAUDE_MEM_API_AGENT_EXTRA_BODY: "",
+        // JSON object merged into every api agent request (My Work refresh, corpus), e.g. {"chat_template_kwargs":{"enable_thinking":false}} for vLLM (#6223). Parsed like CLAUDE_MEM_OPENROUTER_EXTRA_BODY; never sets reasoning or response_format. File/env only
         CLAUDE_MEM_WORK_VIEW_TEXT_LANGUAGE: "",
         // Language for My Work's generated text (titles, reviews, story), such as 'Turkish'. No extra model call; empty uses the language the grouping step finds in the owner's asks, decided once per run (#5660)
         // Automatic local DB snapshots (BackupManager). Off by default; opt-in.
@@ -1536,6 +1558,7 @@ var init_SettingsDefaultsManager = __esm({
         return result;
       }
       static loadFromFile(settingsPath, applyEnvOverrides = true, options = {}) {
+        const warn = options.warn ?? console.warn;
         try {
           const defaults = this.defaultsForSettingsPath(settingsPath);
           if (!existsSync7(settingsPath)) {
@@ -1543,9 +1566,9 @@ var init_SettingsDefaultsManager = __esm({
               try {
                 writeJsonFileAtomic(settingsPath, defaults, { mode: 384 });
                 for (const raised of CHANGED_SHIPPED_DEFAULTS) markRaisedDefaultDone(settingsPath, raised);
-                console.warn("[SETTINGS] Created settings file with defaults:", settingsPath);
+                warn("[SETTINGS] Created settings file with defaults:", settingsPath);
               } catch (error) {
-                console.warn("[SETTINGS] Failed to create settings file, using in-memory defaults:", settingsPath, error instanceof Error ? error.message : String(error));
+                warn("[SETTINGS] Failed to create settings file, using in-memory defaults:", settingsPath, error instanceof Error ? error.message : String(error));
               }
             }
             return this.finalizeSettings(defaults, applyEnvOverrides);
@@ -1560,9 +1583,9 @@ var init_SettingsDefaultsManager = __esm({
             if (!hasPeerRootKeys && !options.readOnly) {
               try {
                 writeJsonFileAtomic(settingsPath, flatSettings, { mode: 384 });
-                console.warn("[SETTINGS] Migrated settings file from nested to flat schema:", settingsPath);
+                warn("[SETTINGS] Migrated settings file from nested to flat schema:", settingsPath);
               } catch (error) {
-                console.warn("[SETTINGS] Failed to auto-migrate settings file:", settingsPath, error instanceof Error ? error.message : String(error));
+                warn("[SETTINGS] Failed to auto-migrate settings file:", settingsPath, error instanceof Error ? error.message : String(error));
               }
             }
           }
@@ -1578,9 +1601,9 @@ var init_SettingsDefaultsManager = __esm({
                   hasPeerRootKeys ? { ...writableRoot, env: flatSettings } : flatSettings,
                   { mode: 384 }
                 );
-                console.warn("[SETTINGS] Migrated Telegram trigger types off the legacy default:", settingsPath);
+                warn("[SETTINGS] Migrated Telegram trigger types off the legacy default:", settingsPath);
               } catch (error) {
-                console.warn("[SETTINGS] Failed to migrate Telegram trigger types:", settingsPath, error instanceof Error ? error.message : String(error));
+                warn("[SETTINGS] Failed to migrate Telegram trigger types:", settingsPath, error instanceof Error ? error.message : String(error));
               }
             }
           }
@@ -1597,12 +1620,12 @@ var init_SettingsDefaultsManager = __esm({
                   hasPeerRootKeys ? { ...writableRoot, env: flatSettings } : flatSettings,
                   { mode: 384 }
                 );
-                console.warn(
+                warn(
                   `[SETTINGS] Migrated Claude model off the pinned ${pinnedModel} to ${this.DEFAULTS.CLAUDE_MEM_MODEL}:`,
                   settingsPath
                 );
               } catch (error) {
-                console.warn("[SETTINGS] Failed to migrate the pinned Claude model:", settingsPath, error instanceof Error ? error.message : String(error));
+                warn("[SETTINGS] Failed to migrate the pinned Claude model:", settingsPath, error instanceof Error ? error.message : String(error));
               }
             }
           }
@@ -1619,12 +1642,12 @@ var init_SettingsDefaultsManager = __esm({
                   hasPeerRootKeys ? { ...writableRoot, env: flatSettings } : flatSettings,
                   { mode: 384 }
                 );
-                console.warn(
+                warn(
                   `[SETTINGS] Migrated OpenRouter model off the retired default ${retiredModel} to ${this.DEFAULTS.CLAUDE_MEM_OPENROUTER_MODEL}:`,
                   settingsPath
                 );
               } catch (error) {
-                console.warn("[SETTINGS] Failed to migrate the retired OpenRouter model:", settingsPath, error instanceof Error ? error.message : String(error));
+                warn("[SETTINGS] Failed to migrate the retired OpenRouter model:", settingsPath, error instanceof Error ? error.message : String(error));
               }
             }
           }
@@ -1641,9 +1664,9 @@ var init_SettingsDefaultsManager = __esm({
                   hasPeerRootKeys ? { ...writableRoot, env: flatSettings } : flatSettings,
                   { mode: 384 }
                 );
-                console.warn("[SETTINGS] Migrated cloud sync hub URL to", rewrittenHubUrl, "from a retired hub host:", settingsPath);
+                warn("[SETTINGS] Migrated cloud sync hub URL to", rewrittenHubUrl, "from a retired hub host:", settingsPath);
               } catch (error) {
-                console.warn("[SETTINGS] Failed to migrate cloud sync hub URL:", settingsPath, error instanceof Error ? error.message : String(error));
+                warn("[SETTINGS] Failed to migrate cloud sync hub URL:", settingsPath, error instanceof Error ? error.message : String(error));
               }
             }
           }
@@ -1667,7 +1690,7 @@ var init_SettingsDefaultsManager = __esm({
                   { mode: 384 }
                 );
                 markRaisedDefaultDone(settingsPath, raised);
-                console.warn(
+                warn(
                   `[SETTINGS] Migrated ${raised.key} off the old ${raised.legacy}${raised.unit} default to ${this.DEFAULTS[raised.key]}${raised.unit}:`,
                   settingsPath
                 );
@@ -1676,7 +1699,7 @@ var init_SettingsDefaultsManager = __esm({
                 const reported = `${raised.key}\0${settingsPath}`;
                 if (!raisedDefaultFailuresReported.has(reported)) {
                   raisedDefaultFailuresReported.add(reported);
-                  console.warn(
+                  warn(
                     raised.applyOnlyWhenSaved ? `[SETTINGS] Failed to migrate ${raised.key}; keeping the saved ${raised.legacy} (reported once per process):` : `[SETTINGS] Failed to migrate ${raised.key}; using the new default in memory (reported once per process):`,
                     settingsPath,
                     error instanceof Error ? error.message : String(error)
@@ -1693,7 +1716,7 @@ var init_SettingsDefaultsManager = __esm({
           }
           return this.finalizeSettings(result, applyEnvOverrides);
         } catch (error) {
-          console.warn("[SETTINGS] Failed to load settings, using defaults:", settingsPath, error instanceof Error ? error.message : String(error));
+          warn("[SETTINGS] Failed to load settings, using defaults:", settingsPath, error instanceof Error ? error.message : String(error));
           const defaults = this.defaultsForSettingsPath(settingsPath);
           return this.finalizeSettings(defaults, applyEnvOverrides);
         }
@@ -2439,13 +2462,18 @@ function outputText(call, response) {
   return typeof call.tool_response === "string" ? call.tool_response : "";
 }
 function commitSubjects(command2) {
-  const starts = [...command2.matchAll(gitPattern(String.raw`commit\b`, "g"))].map((match) => match.index);
+  const starts = [...command2.matchAll(gitPattern(String.raw`commit\b`, "g"))].map((match) => match.index + match[0].length);
   return starts.map((start, index) => {
     const invocation = command2.slice(start, starts[index + 1]);
-    const substituted = invocation.match(/\s-[a-zA-Z]*m\s+"\$\(\s*cat\s+<<-?\s*['"]?\w+['"]?[^\n]*\n([^\n]*)/);
+    const argumentEnd = invocation.match(/^(?:>[&|]|<&|&>>?|[^"'\\;&|\n]|\\[\s\S]|"(?:[^"\\]|\\[\s\S])*"|'[^']*')*/)[0].length;
+    const matchArgument = (pattern) => {
+      const match = invocation.match(pattern);
+      return match && match.index < argumentEnd ? match : null;
+    };
+    const substituted = matchArgument(/\s(?:-[a-zA-Z]*m\s+|--message(?:=|\s+))"\$\(\s*cat\s+<<-?\s*['"]?\w+['"]?[^\n]*\n([^\n]*)/);
     if (substituted) return short(substituted[1]);
-    const inline = invocation.match(/\s-[a-zA-Z]*m\s+(?:"((?:[^"\\]|\\.)*)"|'([^']*)')/);
-    const heredoc = invocation.match(/\s-F\s+-\s*<<-?\s*['"]?\w+['"]?\n([^\n]*)/);
+    const inline = matchArgument(/\s(?:-[a-zA-Z]*m\s+|--message(?:=|\s+))(?:"((?:[^"\\]|\\.)*)"|'([^']*)')/);
+    const heredoc = matchArgument(/\s-F\s+-\s*<<-?\s*['"]?\w+['"]?\n([^\n]*)/);
     const text5 = inline ? inline[1]?.replace(BASH_DOUBLE_QUOTE_ESCAPE, "$1") ?? inline[2] : heredoc?.[1];
     return short(text5?.split("\n")[0]);
   });
@@ -2726,11 +2754,17 @@ function mergeProducts(lists, limit = 60) {
     const repos = product.sha ? repoByHead.get(product.sha) : null;
     return product.repo ?? pushedAfter(product) ?? (repos?.size === 1 ? [...repos][0] : null);
   };
-  for (const product of products) if (product.kind === "commit" && repoOf(product) && sourceKey(product)) repoBySource.set(sourceKey(product), repoOf(product));
+  for (const product of products) if (product.kind === "commit") {
+    const source = sourceKey(product), repo = repoOf(product);
+    if (!source || !repo) continue;
+    if (!repoBySource.has(source)) repoBySource.set(source, /* @__PURE__ */ new Set());
+    repoBySource.get(source).add(repo);
+  }
   const unique = /* @__PURE__ */ new Map();
   for (const product of products.sort((a, b) => (b.atEpoch ?? 0) - (a.atEpoch ?? 0))) {
     const isGit = product.kind === "commit" || product.kind === "branch";
-    const repo = isGit && !product.repo ? repoOf(product) ?? (product.kind === "commit" ? repoBySource.get(sourceKey(product)) : null) : null;
+    const sourceRepos = repoBySource.get(sourceKey(product));
+    const repo = isGit && !product.repo ? repoOf(product) ?? (product.kind === "commit" && sourceRepos?.size === 1 ? [...sourceRepos][0] : null) : null;
     const resolved = repo || isGit && product.repo ? { ...product, ...repo ? { repo } : {}, url: gitUrl({ ...product, repo: repo ?? product.repo }) } : product;
     const key = productKey(resolved);
     if (!unique.has(key)) unique.set(key, resolved);
@@ -3574,6 +3608,18 @@ function humanRequestTitle(original) {
   const cut = clause.slice(0, 99), boundary = cut.lastIndexOf(" ");
   return `${cut.slice(0, boundary > 60 ? boundary : 99).trimEnd()}\u2026`;
 }
+function placeholderTitleFromAsk(askText) {
+  const ask = requestText(askText ?? null, FOCUS_ASK_CHARS);
+  return humanRequestTitle(ask) || requestText(ask, 120) || "Untitled request";
+}
+function comparableWords(text5) {
+  return String(text5 ?? "").replace(/\[([^\]]+)\]\([^)]*\)/g, "$1").replace(/[*_`#]/g, "").toLowerCase().replace(/\s+/g, " ").trim().replace(/[\s.!?…:;,]+$/u, "");
+}
+function copiesOpeningAsk(title, askText) {
+  const words = comparableWords(title);
+  if (words === comparableWords(placeholderTitleFromAsk(askText))) return true;
+  return words.length > 0 && comparableWords(requestText(askText ?? null, FOCUS_ASK_CHARS)).startsWith(words);
+}
 function conversationKey(session) {
   if (!session?.content_session_id || !session?.platform_source) return null;
   return JSON.stringify(["conversation", session.platform_source, session.content_session_id]);
@@ -3594,7 +3640,7 @@ function originalFor(session, prompts) {
   if (isHumanActionRequest(session.user_prompt)) return initial();
   return null;
 }
-function buildHumanRequests(view, records2 = {}, { titleCache = {}, ledger = null, onProductFile = null } = {}) {
+function buildHumanRequests(view, records2 = {}, { titleCache = {}, ledger = null, onProductFile = null, localFiles = true, getProjectRoot = projectRoot } = {}) {
   const sessions = new Map((records2.sessions ?? []).map((session) => [session.id, session]));
   const prompts = records2.prompts ?? [];
   const promptsBySession = /* @__PURE__ */ new Map();
@@ -3637,9 +3683,9 @@ function buildHumanRequests(view, records2 = {}, { titleCache = {}, ledger = nul
     if (key && !sessionsByKey.has(key)) sessionsByKey.set(key, session);
   }
   const rootFromMembers = (groupId, group) => {
-    const anchorRoot = projectRoot(sessionsByKey.get(group.anchor)?.project);
+    const anchorRoot = getProjectRoot(sessionsByKey.get(group.anchor)?.project);
     if (anchorRoot) return anchorRoot;
-    const memberRoots = new Set(Object.entries(ledger.groups.conversations).filter(([, id]) => id === groupId).map(([key]) => projectRoot(sessionsByKey.get(key)?.project)).filter(Boolean));
+    const memberRoots = new Set(Object.entries(ledger.groups.conversations).filter(([, id]) => id === groupId).map(([key]) => getProjectRoot(sessionsByKey.get(key)?.project)).filter(Boolean));
     return memberRoots.size === 1 ? [...memberRoots][0] : NO_PROJECT;
   };
   const derivedRoots = /* @__PURE__ */ new Map();
@@ -3649,14 +3695,14 @@ function buildHumanRequests(view, records2 = {}, { titleCache = {}, ledger = nul
       if (!derivedRoots.has(groupId)) derivedRoots.set(groupId, rootFromMembers(groupId, group));
       return derivedRoots.get(groupId);
     }
-    return projectRoot(sessionsByKey.get(group?.anchor)?.project);
+    return getProjectRoot(sessionsByKey.get(group?.anchor)?.project);
   };
   const groupFor = (key, session) => {
     const groupId = key ? ledger?.groups?.conversations?.[key] ?? null : null;
     if (!groupId) return null;
     const storedRoot = ledger.groups.groups[groupId]?.projectRoot;
     if (typeof storedRoot === "string" && storedRoot !== NO_PROJECT) return groupId;
-    const own = projectRoot(session?.project), expected = groupRoot(groupId);
+    const own = getProjectRoot(session?.project), expected = groupRoot(groupId);
     return own == null || expected == null || own === expected || storedRoot === NO_PROJECT && own === NO_PROJECT ? groupId : null;
   };
   const requests = /* @__PURE__ */ new Map(), unlinkedWork = [];
@@ -3712,7 +3758,7 @@ function buildHumanRequests(view, records2 = {}, { titleCache = {}, ledger = nul
       continue;
     }
     const groupId = !explicit ? groupFor(key, session) : null;
-    const root = projectRoot(session?.project) ?? projectRoot(item.project);
+    const root = getProjectRoot(session?.project) ?? getProjectRoot(item.project);
     const id = explicit ? JSON.stringify(root == null ? ["explicit-request", explicit] : ["explicit-request", root, explicit]) : groupId ? JSON.stringify(["overall-request", groupId]) : key;
     const request = requestFor(id, { key, original, groupId, explicit, explicitText });
     addProject(request, session?.project);
@@ -3750,13 +3796,13 @@ function buildHumanRequests(view, records2 = {}, { titleCache = {}, ledger = nul
     const merged = mergeProducts([...recordedProducts.get(request) ?? [], ...request.items.flatMap((item) => item.workProduct ?? [])]);
     request.sourceProductHash = createHash4("sha256").update(canonicalJson(JSON.parse(JSON.stringify(merged)))).digest("hex");
     request.sourceProductRecordedAtEpoch = merged.every((product) => Number.isFinite(product.atEpoch) && product.atEpoch > 0) ? merged.reduce((latest, product) => Math.max(latest, product.atEpoch), 0) : null;
-    const copies = merged.filter((product) => product.deliverable && product.sourcePath);
+    const copies = localFiles ? merged.filter((product) => product.deliverable && product.sourcePath) : [];
     const coverage = new Map(copies.map((copy) => [copy, copyCoversSource(copy, copy.sourcePath)]));
     const covered = (product) => Boolean(product.path) && copies.some((copy) => copy.sourcePath === product.path && coverage.get(copy));
     request.workProduct = merged.filter((product) => !covered(product)).map((product) => {
-      const available = product.path ? Boolean(servableFile(product)) : product.deliverable ? bucketFileAvailable(product) : true;
+      const available = product.path ? localFiles && Boolean(servableFile(product)) : product.deliverable ? localFiles && bucketFileAvailable(product) : true;
       if (product.path || product.bucketPath) onProductFile?.(product, available, coverage.get(product) ?? null);
-      return { ...product, fileUrl: fileUrl(product), available };
+      return { ...product, fileUrl: localFiles ? fileUrl(product) : null, available };
     });
     const relatedIds = new Set(request.conversationKeys.flatMap((key) => sessionIdsByKey.get(key) ?? []));
     const related = [...relatedIds].flatMap((id) => promptsBySession.get(id) ?? []);
@@ -3819,7 +3865,7 @@ function buildHumanRequests(view, records2 = {}, { titleCache = {}, ledger = nul
   }
   return { humanRequests: [...requests.values()].sort((a, b) => b.updatedAtEpoch - a.updatedAtEpoch), unlinkedWork };
 }
-var REQUEST_MEDIA_PREVIEW_LIMIT, ENGLISH_ACTION, IMPERATIVE_OPENING, NOT_A_VERB, ENGLISH_WORDS, isConversationKey;
+var REQUEST_MEDIA_PREVIEW_LIMIT, ENGLISH_ACTION, IMPERATIVE_OPENING, NOT_A_VERB, ENGLISH_WORDS, isConversationKey, FOCUS_ASK_CHARS;
 var init_request_projection = __esm({
   "src/services/work-view/request-projection.mjs"() {
     "use strict";
@@ -3839,6 +3885,7 @@ var init_request_projection = __esm({
         return false;
       }
     };
+    FOCUS_ASK_CHARS = 400;
   }
 });
 
@@ -4196,6 +4243,17 @@ var init_nav_words = __esm({
   }
 });
 
+// src/services/work-view/focus-done-date.mjs
+function doneAtAfterChange({ statusBefore, doneAtBefore, statusAfter, changedAt }) {
+  if (statusAfter !== "done") return null;
+  return statusBefore === "done" ? doneAtBefore : changedAt;
+}
+var init_focus_done_date = __esm({
+  "src/services/work-view/focus-done-date.mjs"() {
+    "use strict";
+  }
+});
+
 // src/services/work-view/my-focus.mjs
 function applyPatch(target, fields) {
   for (const [key, value] of Object.entries(fields)) {
@@ -4221,11 +4279,13 @@ function buildFocusAreas(state, { localDeviceId: localDeviceId2 = null } = {}) {
       if (focusAreaId === OTHER_FOCUS_AREA_ID) throw new Error(`A my-focus area row uses the reserved id "${OTHER_FOCUS_AREA_ID}".`);
       const decidedBy = event.fields.decided_by;
       if (!FOCUS_AREA_DECIDED_BY.includes(decidedBy)) throw new Error(`Focus area ${focusAreaId} has an unknown writer: ${decidedBy}`);
-      const area = areas.get(focusAreaId) ?? { fields: {}, ownerDecided: false, savedAt: null };
+      const area = areas.get(focusAreaId) ?? { fields: {}, ownerDecided: false, savedAt: null, doneAt: null };
       if (area.ownerDecided && decidedBy === "system") continue;
+      const statusBefore = area.fields.status;
       applyPatch(area.fields, event.fields);
       if (decidedBy !== "system") area.ownerDecided = decidedBy === "owner";
       area.savedAt = event.at;
+      area.doneAt = doneAtAfterChange({ statusBefore, doneAtBefore: area.doneAt, statusAfter: area.fields.status, changedAt: event.at });
       areas.set(focusAreaId, area);
     } else if (event.task.startsWith(PLACEMENT_TASK_PREFIX)) {
       const anchor = text2(event.fields.anchor_conversation_key) || event.task.slice(PLACEMENT_TASK_PREFIX.length);
@@ -4238,7 +4298,7 @@ function buildFocusAreas(state, { localDeviceId: localDeviceId2 = null } = {}) {
       placements.set(anchor, placement);
     }
   }
-  const focusAreas = [...areas].map(([focusAreaId, { fields, savedAt }]) => {
+  const focusAreas = [...areas].map(([focusAreaId, { fields, savedAt, doneAt }]) => {
     if (!text2(fields.name)) throw new Error(`Focus area ${focusAreaId} has no name.`);
     if (!FOCUS_AREA_STATUSES.includes(fields.status)) throw new Error(`Focus area ${focusAreaId} has an unknown status: ${fields.status}`);
     if (!FOCUS_AREA_SOURCES.includes(fields.source)) throw new Error(`Focus area ${focusAreaId} has an unknown source: ${fields.source}`);
@@ -4254,7 +4314,8 @@ function buildFocusAreas(state, { localDeviceId: localDeviceId2 = null } = {}) {
       mergedInto: text2(fields.merged_into) || null,
       evidence: text2(fields.evidence) || null,
       decidedBy: fields.decided_by,
-      savedAt
+      savedAt,
+      doneAt
     };
   }).sort((a, b) => (a.ownerRank ?? Infinity) - (b.ownerRank ?? Infinity) || (a.priorityRank ?? Infinity) - (b.priorityRank ?? Infinity) || a.name.localeCompare(b.name));
   const byId = new Map(focusAreas.map((area) => [area.focusAreaId, area]));
@@ -4301,6 +4362,7 @@ var init_my_focus = __esm({
     init_work_state_limits();
     init_work_state_reduce();
     init_nav_words();
+    init_focus_done_date();
     MY_FOCUS_LIST = "my-focus";
     OTHER_FOCUS_AREA_ID = "other";
     FOCUS_AREA_TASK_PREFIX = "Focus area: ";
@@ -4739,9 +4801,6 @@ async function judgeConversation(conversation2, openRequests, judge) {
     ...band === "new" && pick2.requestId != null ? { rejected: pick2.requestId } : {}
   };
 }
-function ownTitle(openingAsk) {
-  return humanRequestTitle(openingAsk) || requestText(openingAsk, 120) || "Untitled request";
-}
 async function routeUndecided({ dir = LEDGER_DIR, database, judge = null, now = Date.now(), days = 14, apply = false }) {
   const judges = [rulesJudge, ...judge ? [judge] : []];
   const ledger = readLedger(dir);
@@ -4807,7 +4866,7 @@ async function routeUndecided({ dir = LEDGER_DIR, database, judge = null, now = 
         skip.add(key);
         continue;
       }
-      const title = ownTitle(conversation2.openingAsk);
+      const title = placeholderTitleFromAsk(conversation2.openingAsk);
       const decisions = target ? { groups: [{ title: target.title, conversations: [target.anchor, key], links: [{ kind: "judge", conversations: [target.anchor, key], evidence: verdict.evidence }], ...typeof root === "string" && root ? { projectRoot: root } : {} }] } : { groups: [{ title, conversations: [key] }] };
       working = applyDecisions(working, decisions, { database, now, excludedPromptIds: ledger.agentWrittenPromptIds });
       const suggested = verdict.band === "suggest" ? live(picked) : null;
@@ -4864,7 +4923,7 @@ function decideSuggestion({ dir, database, conversationKey: conversationKey2, ac
     if (groups.conversations[conversationKey2]) next = structuredClone(groups);
     else {
       const [candidate] = readCandidates(database, { conversationKeys: [conversationKey2], excludedPromptIds: ledger.agentWrittenPromptIds });
-      next = applyDecisions(groups, { groups: [{ title: ownTitle(candidate?.firstAsk ?? ""), conversations: [conversationKey2] }] }, { database, now, excludedPromptIds: ledger.agentWrittenPromptIds, enrichGroupIds: resolution?.groupKeys ?? null });
+      next = applyDecisions(groups, { groups: [{ title: placeholderTitleFromAsk(candidate?.firstAsk ?? ""), conversations: [conversationKey2] }] }, { database, now, excludedPromptIds: ledger.agentWrittenPromptIds, enrichGroupIds: resolution?.groupKeys ?? null });
     }
     next.suggestions = { ...next.suggestions ?? {}, [conversationKey2]: { ...suggestion, status: "declined", resolvedAt: iso2(now), evidence: `Owner declined: not part of "${request?.title ?? suggestion.requestId}". ${suggestion.evidence}` } };
     next.updatedAt = iso2(now);
@@ -4884,7 +4943,6 @@ var init_request_judge = __esm({
     init_paths();
     init_SettingsDefaultsManager();
     init_request_groups();
-    init_request_projection();
     DAY_MS = 864e5;
     iso2 = (epoch2) => new Date(epoch2).toISOString();
     JOIN_THRESHOLD = 0.8;
@@ -4917,7 +4975,7 @@ var init_request_judge = __esm({
 });
 
 // src/services/work-view/request-groups.mjs
-import { Database } from "bun:sqlite";
+import { createRequire } from "node:module";
 import { createHash as createHash5 } from "node:crypto";
 import { readFileSync as readFileSync9, readdirSync, statSync as statSync6 } from "node:fs";
 import { homedir as homedir9 } from "node:os";
@@ -4938,7 +4996,7 @@ function queryInChunks(database, values2, sqlFor, parametersFor = (chunk) => chu
   }
   return rows;
 }
-function readCandidates(database, { sinceEpoch = 0, conversationKeys = null, fullAsks = false, excludedPromptIds = null }) {
+function readCandidates(database, { sinceEpoch = 0, conversationKeys = null, fullAsks = false, recentAsks = false, excludedPromptIds = null }) {
   const columns = "SELECT id, platform_source, content_session_id, project, user_prompt, started_at_epoch FROM sdk_sessions";
   const pairs = conversationKeys?.map((key) => JSON.parse(key).slice(1));
   const stored = pairs ? queryInChunks(database, pairs, (chunk) => `${columns} WHERE (platform_source, content_session_id) IN (VALUES ${chunk.map(() => "(?, ?)").join(",")})`, (chunk) => chunk.flat(), 250) : database.prepare(`${columns} WHERE started_at_epoch >= ?
@@ -4983,7 +5041,7 @@ function readCandidates(database, { sinceEpoch = 0, conversationKeys = null, ful
       startedAtEpoch: original.atEpoch ?? session.started_at_epoch,
       lastActivityEpoch: Math.max(lastPrompt, observationsBySession.get(session.id)?.last_epoch ?? 0, lastToolUseBySession.get(session.id) ?? 0, session.started_at_epoch ?? 0),
       firstAsk: requestText(original.text, 600),
-      asks: fullAsks ? asks : asks.slice(0, 10),
+      asks: fullAsks ? asks : recentAsks ? asks.slice(-10) : asks.slice(0, 10),
       askCount: asks.length,
       original,
       workLists: [],
@@ -5092,7 +5150,7 @@ function writeJsonAtomic(path4, value) {
   writeJsonFileAtomic(path4, stored, { mode: 384 });
   finish?.();
 }
-function applyGroupDecisions(stored, decisions, now = Date.now(), { projectOf = /* @__PURE__ */ new Map() } = {}) {
+function applyGroupDecisions(stored, decisions, now = Date.now(), { projectOf = /* @__PURE__ */ new Map(), getProjectRoot = projectRoot } = {}) {
   if (!Array.isArray(decisions?.groups)) throw new TypeError("Decisions need a groups array.");
   const next = structuredClone(stored ?? emptyGroups());
   for (const [index, decision] of decisions.groups.entries()) {
@@ -5121,13 +5179,13 @@ function applyGroupDecisions(stored, decisions, now = Date.now(), { projectOf = 
     const allMembers = [.../* @__PURE__ */ new Set([...decision.conversations, ...Object.entries(next.conversations).filter(([key, groupId]) => groupId === id && !decision.conversations.includes(key)).map(([key]) => key)])];
     const storedRoot = upgradedGroupRoot(
       next.groups[id]?.projectRoot,
-      projectRoot(projectOf.get(next.groups[id]?.anchor)),
-      allMembers.map((key) => projectRoot(projectOf.get(key)))
+      getProjectRoot(projectOf.get(next.groups[id]?.anchor)),
+      allMembers.map((key) => getProjectRoot(projectOf.get(key)))
     );
     const rootWasUnknown = storedRoot === NO_PROJECT;
     const roots = /* @__PURE__ */ new Map();
     for (const key of allMembers) {
-      const root = projectRoot(projectOf.get(key));
+      const root = getProjectRoot(projectOf.get(key));
       if (root == null || rootWasUnknown && root === NO_PROJECT && !decision.conversations.includes(key)) continue;
       roots.set(root, [...roots.get(root) ?? [], key]);
     }
@@ -5215,6 +5273,15 @@ function reviewList(value, max, label, options) {
   const newestIndexes = new Set(list2.map((_, index) => index).sort((a, b) => times[a] - times[b] || a - b).slice(-max));
   return list2.filter((_, index) => newestIndexes.has(index));
 }
+function quotedPreferences(list2, options) {
+  if (!options.coerce || !Array.isArray(list2)) return list2;
+  const said = (value) => typeof value === "string" && value.trim() !== "";
+  return list2.filter((preference2, index) => {
+    if (said(preference2?.preference) && said(preference2?.quote)) return true;
+    options.droppedPreferences.add(`preferences[${index}]`);
+    return false;
+  });
+}
 function validateOutcome(outcome2, options = {}) {
   if (outcome2 == null) return null;
   if (typeof outcome2 !== "object" || Array.isArray(outcome2)) throw new TypeError("outcome must be an object.");
@@ -5250,7 +5317,7 @@ function validateOutcome(outcome2, options = {}) {
 }
 function validateProgress(entry, knownGroups, options = {}) {
   if (!entry || typeof entry !== "object") throw new TypeError("Progress must be an object.");
-  options = { coerce: false, coercedFields: /* @__PURE__ */ new Set(), ...options };
+  options = { coerce: false, coercedFields: /* @__PURE__ */ new Set(), droppedPreferences: /* @__PURE__ */ new Set(), ...options };
   const text5 = (value, max, label, optional2 = false) => reviewText(value, max, label, { ...options, optional: optional2 });
   if (!knownGroups[entry.groupId]) throw new TypeError(`Unknown group ${entry.groupId}.`);
   const basis = entry.reviewBasis;
@@ -5262,7 +5329,7 @@ function validateProgress(entry, knownGroups, options = {}) {
   for (const field of ["startedAt", "shippedAt", "lastActivityAt"]) if (!isIsoOrNull(entry[field] ?? null)) throw new TypeError(`${field} must be an ISO date or null.`);
   if (entry.state === "shipped" && (entry.percent !== 100 || !entry.shippedAt)) throw new TypeError("A shipped request needs percent 100 and shippedAt.");
   if (entry.state !== "shipped" && entry.shippedAt) throw new TypeError("Only a shipped request has shippedAt.");
-  const milestones = reviewList(entry.milestones, 12, "milestones", options), preferences = reviewList(entry.preferences, 10, "preferences", options);
+  const milestones = reviewList(entry.milestones, 12, "milestones", options), preferences = reviewList(quotedPreferences(entry.preferences, options), 10, "preferences", options);
   return {
     groupId: entry.groupId,
     state: entry.state,
@@ -5366,6 +5433,33 @@ function validateStory(story) {
     }))
   };
 }
+function storyInput(groups, reviews, story) {
+  const update = Number.isFinite(Date.parse(story?.writtenAt ?? ""));
+  const previousNarrativeChars = story?.narrative?.length ?? 0;
+  return {
+    groups,
+    update,
+    narrativeTarget: STORY_NARRATIVE_TARGET,
+    narrativeLimit: STORY_NARRATIVE_MAX,
+    previousNarrativeChars,
+    roomChars: Math.max(0, STORY_NARRATIVE_TARGET - previousNarrativeChars),
+    condenseChars: Math.max(0, previousNarrativeChars - STORY_NARRATIVE_TARGET),
+    previousParts: update ? storyParts(story.narrative) : [],
+    mergeOldestChapters: update ? storyChaptersToMerge(story.narrative) : 0,
+    reviews,
+    // Rules owner-goals put in the story are its own (record-story carries them over): shown here, the story model
+    // would echo them back without their source and when, leaving copies a later owner-goals save cannot replace.
+    previousStory: story && { ...story, preferences: (story.preferences ?? []).filter((preference2) => preference2?.source !== OWNER_GOALS_LIST) }
+  };
+}
+function readRefreshStatus(dir) {
+  try {
+    return readJson(join11(dir, "refresh.json"), null);
+  } catch (error) {
+    if (error instanceof SyntaxError) return null;
+    throw error;
+  }
+}
 function readLedger(dir = LEDGER_DIR) {
   const groups = readJson(join11(dir, "request-groups.json"), emptyGroups());
   const progress = {};
@@ -5383,7 +5477,7 @@ function readLedger(dir = LEDGER_DIR) {
     groups,
     progress,
     story: readJson(join11(dir, "story.json"), null),
-    refresh: readJson(join11(dir, "refresh.json"), null),
+    refresh: readRefreshStatus(dir),
     agentWrittenPromptIds: new Set(readJson(join11(dir, AGENT_WRITTEN_PROMPTS_FILE), { promptIds: [] }).promptIds ?? [])
   };
 }
@@ -5435,9 +5529,9 @@ function requestRecord(ledger, groupId, asks, conversations) {
     conversationAsks: conversations.map((key) => requestText(asks.get(key) ?? null, FOCUS_ASK_CHARS)).filter(Boolean)
   };
 }
-function basisForConversations(ledger, groupId, conversations) {
+function basisForConversations(ledger, groupId, conversations, title = ledger.groups.groups[groupId].title) {
   const group = ledger.groups.groups[groupId];
-  return createHash5("sha256").update(JSON.stringify({ title: group.title, firstAsk: group.anchorAsk?.text ?? null, conversations })).digest("hex").slice(0, 16);
+  return createHash5("sha256").update(JSON.stringify({ title, firstAsk: group.anchorAsk?.text ?? null, conversations })).digest("hex").slice(0, 16);
 }
 function focusRequestIndex(ledger) {
   let byGroup;
@@ -5458,7 +5552,15 @@ function focusRequestIndex(ledger) {
     basis: (groupId) => {
       if (!bases.has(groupId)) bases.set(groupId, basisForConversations(ledger, groupId, conversations(groupId)));
       return bases.get(groupId);
-    }
+    },
+    /** The basis the request had while it showed the placeholder copied from its ask. Naming (section 3) replaces only
+     * that title, so a placement made under the placeholder still stands once the request is named (focusDue). */
+    placeholderBasis: (groupId) => basisForConversations(
+      ledger,
+      groupId,
+      conversations(groupId),
+      placeholderTitleFromAsk(ledger.groups.groups[groupId].anchorAsk?.text ?? null)
+    )
   };
 }
 function focusDue(ledger, focus, localDeviceId2, requests) {
@@ -5467,7 +5569,7 @@ function focusDue(ledger, focus, localDeviceId2, requests) {
     if (placement?.owner && focus.resolveFocusAreaId(placement.owner.focusAreaId)) return false;
     const router = placement?.router;
     if (!router || !focus.resolveFocusAreaId(router.focusAreaId)) return true;
-    return router.device === localDeviceId2 && router.basis != null && router.basis !== requests.basis(groupId);
+    return router.device === localDeviceId2 && router.basis != null && router.basis !== requests.basis(groupId) && router.basis !== requests.placeholderBasis(groupId);
   });
 }
 function routerOther(ledger, focus, queued) {
@@ -5561,6 +5663,18 @@ function validateFocusAnswer(answer, input, ledger, { other = false } = {}) {
     ...other ? { otherPassHash: otherPassHash(ledger, [...listed.keys()].filter((anchor) => !held.has(anchor)).map((anchor) => listed.get(anchor).groupId), requestIndex) } : {}
   };
 }
+function hasPlaceholderTitle(group) {
+  return copiesOpeningAsk(group.title, group.anchorAsk?.text ?? null);
+}
+function writtenTitle(value, askText, label) {
+  const title = boundedText(value, 120, label);
+  if (copiesOpeningAsk(title, askText)) throw new TypeError(`${label} repeats the owner's ask ("${placeholderTitleFromAsk(askText)}"). Name the task in about 5 to 7 words of your own, not words the ask starts with.`);
+  return title;
+}
+function titleInput(ledger, database, { limit = TITLE_BATCH } = {}) {
+  const owed = Object.keys(ledger.groups.groups).filter((groupId) => hasPlaceholderTitle(ledger.groups.groups[groupId]));
+  return { requests: records(database, ledger, owed.slice(0, limit), focusRequestIndex(ledger)), remaining: Math.max(0, owed.length - limit) };
+}
 function refreshNeeds({ dir = LEDGER_DIR, database, now = Date.now(), days = 14, localDeviceId: localDeviceId2 }) {
   requireDeviceId(localDeviceId2);
   const ledger = readLedger(dir);
@@ -5592,7 +5706,8 @@ function option(args, name, fallback) {
 function openDatabase() {
   const path4 = process.env.CLAUDE_MEM_DB ?? join11(DATA_DIR2, "claude-mem.db");
   statSync6(path4);
-  const database = new Database(path4, { readonly: true, create: false });
+  const { Database: Database2 } = createRequire(typeof __filename === "string" ? __filename : import.meta.url)("bun:sqlite");
+  const database = new Database2(path4, { readonly: true, create: false });
   database.exec("PRAGMA busy_timeout = 1500");
   return database;
 }
@@ -5606,7 +5721,7 @@ function readConversationProjects(database, conversationKeys) {
   return new Map(withDerivedProjects(database, sessions).map((session) => [conversationKey(session), session.project]));
 }
 function groupingInput(ledger, database, { sinceEpoch, limit = GROUPING_BATCH, skip = null }) {
-  const candidates = readCandidates(database, { sinceEpoch, excludedPromptIds: ledger.agentWrittenPromptIds });
+  const candidates = readCandidates(database, { sinceEpoch, recentAsks: true, excludedPromptIds: ledger.agentWrittenPromptIds });
   const decided = (key) => Boolean(ledger.groups.conversations[key] || ledger.groups.ignored?.[key] || skip?.has(key));
   const fresh = candidates.filter((candidate) => !decided(candidate.conversationKey));
   if (!fresh.length) return { root: null, conversations: [], openRequests: [], proposedLinks: [], remaining: 0 };
@@ -5620,7 +5735,7 @@ function groupingInput(ledger, database, { sinceEpoch, limit = GROUPING_BATCH, s
   const groupRoot = (group) => rootIsStored(group) ? upgradedGroupRoot(group.projectRoot, projectRoot(anchorProjects.get(group.anchor))) : projectRoot(anchorProjects.get(group.anchor)) ?? group.projectRoot ?? null;
   const openRequests = Object.entries(ledger.groups.groups).filter(([groupId, group]) => groupRoot(group) === root && !CLOSED_STATES.has(ledger.progress[groupId]?.state)).map(([groupId, group]) => {
     const members = Object.entries(ledger.groups.conversations).filter(([, id]) => id === groupId).map(([key]) => byKey.get(key)).filter(Boolean);
-    const asks = members.flatMap((member) => member.asks).sort((a, b) => Date.parse(b.at) - Date.parse(a.at));
+    const asks = members.flatMap((member) => member.asks).sort((a, b) => Date.parse(b.at) - Date.parse(a.at) || b.promptId - a.promptId);
     return {
       groupId,
       title: group.title,
@@ -5706,36 +5821,52 @@ function runCli(argv, { dir = LEDGER_DIR, database = null, now = Date.now(), pri
   }
   if (command2 === "record-progress") {
     const ledger = readLedger(dir);
-    const coercedFields = /* @__PURE__ */ new Set();
-    const reviewed = validateProgress(readInput(args[0] ?? "-"), ledger.groups.groups, { coerce: coerceProgress, coercedFields });
+    const coercedFields = /* @__PURE__ */ new Set(), droppedPreferences = /* @__PURE__ */ new Set();
+    const reviewed = validateProgress(readInput(args[0] ?? "-"), ledger.groups.groups, { coerce: coerceProgress, coercedFields, droppedPreferences });
     const checkedAt = iso3(now);
     const previous = ledger.progress[reviewed.groupId];
     const unchanged = previous && JSON.stringify(storyFacts(previous)) === JSON.stringify(storyFacts(reviewed));
     const entry = { ...reviewed, checkedAt, changedAt: unchanged ? previous.changedAt ?? previous.checkedAt : checkedAt, readings: appendReading(ledger.progress[reviewed.groupId], { at: checkedAt, percent: reviewed.percent }) };
     writeJsonAtomic(join11(dir, "progress", `${entry.groupId}.json`), entry);
-    return print2({ recorded: entry.groupId, state: entry.state, percent: entry.percent, readings: entry.readings.length, ...coercedFields.size ? { coercedFields: [...coercedFields] } : {} });
+    return print2({
+      recorded: entry.groupId,
+      state: entry.state,
+      percent: entry.percent,
+      readings: entry.readings.length,
+      ...coercedFields.size ? { coercedFields: [...coercedFields] } : {},
+      ...droppedPreferences.size ? { droppedPreferences: [...droppedPreferences] } : {}
+    });
+  }
+  if (command2 === "title-input") return print2(titleInput(readLedger(dir), db(), { limit: option(args, "limit", TITLE_BATCH) }));
+  if (command2 === "record-titles") {
+    const { groups } = readLedger(dir);
+    const answer = readInput(args[0] ?? "-");
+    if (!Array.isArray(answer?.titles)) throw new TypeError("The answer needs a titles array.");
+    let titled = 0;
+    for (const [index, entry] of answer.titles.entries()) {
+      const group = groups.groups[entry?.groupId];
+      if (!group) throw new TypeError(`titles[${index}] names unknown group ${entry?.groupId}.`);
+      const title = writtenTitle(entry.title, group.anchorAsk?.text ?? null, `titles[${index}].title`);
+      if (hasPlaceholderTitle(group)) {
+        group.title = title;
+        titled++;
+      }
+    }
+    if (titled) {
+      groups.updatedAt = iso3(now);
+      writeJsonAtomic(join11(dir, "request-groups.json"), groups);
+    }
+    return print2({ titled, kept: answer.titles.length - titled });
   }
   if (command2 === "story-input") {
     const { groups, progress, story } = readLedger(dir);
     const reviews = Object.values(progress).sort((a, b) => String(a.startedAt).localeCompare(String(b.startedAt)));
     const writtenAt = Date.parse(story?.writtenAt ?? "");
-    const update = Number.isFinite(writtenAt);
-    const previousNarrativeChars = story?.narrative?.length ?? 0;
-    return print2({
-      groups: Object.keys(groups.groups).length,
-      update,
-      narrativeTarget: STORY_NARRATIVE_TARGET,
-      narrativeLimit: STORY_NARRATIVE_MAX,
-      previousNarrativeChars,
-      roomChars: Math.max(0, STORY_NARRATIVE_TARGET - previousNarrativeChars),
-      condenseChars: Math.max(0, previousNarrativeChars - STORY_NARRATIVE_TARGET),
-      previousParts: update ? storyParts(story.narrative) : [],
-      mergeOldestChapters: update ? storyChaptersToMerge(story.narrative) : 0,
-      reviews: update ? reviews.filter((review) => Date.parse(review.changedAt ?? review.checkedAt) > writtenAt) : reviews,
-      // Rules owner-goals put in the story are its own (record-story carries them over): shown here, the story model
-      // would echo them back without their source and when, leaving copies a later owner-goals save cannot replace.
-      previousStory: story && { ...story, preferences: (story.preferences ?? []).filter((preference2) => preference2?.source !== OWNER_GOALS_LIST) }
-    });
+    return print2(storyInput(
+      Object.keys(groups.groups).length,
+      Number.isFinite(writtenAt) ? reviews.filter((review) => Date.parse(review.changedAt ?? review.checkedAt) > writtenAt) : reviews,
+      story
+    ));
   }
   if (command2 === "record-story") {
     const validated = validateStory(readInput(args[0] ?? "-"));
@@ -5758,9 +5889,9 @@ function runCli(argv, { dir = LEDGER_DIR, database = null, now = Date.now(), pri
     return Promise.resolve(saveFocus2(body)).then((saved) => print2({ placed: saved.placed, proposed: saved.focusAreaIds.length, focusAreaIds: saved.focusAreaIds }));
   }
   if (command2 === "refresh-needs") return print2(refreshNeeds({ dir, database: db(), now, days: option(args, "days", 14), localDeviceId: localDeviceId2 }));
-  throw new TypeError("Usage: request-groups.mjs candidates|grouping-input|judge|apply|pending|show|record-progress|story-input|record-story|focus-input|record-focus|refresh-needs (see file header).");
+  throw new TypeError("Usage: request-groups.mjs candidates|grouping-input|judge|apply|pending|show|record-progress|title-input|record-titles|story-input|record-story|focus-input|record-focus|refresh-needs (see file header).");
 }
-var DATA_DIR2, LEDGER_DIR, AGENT_WRITTEN_PROMPTS_FILE, DAY_MS2, GOALS_STALE_MS, MAX_CONVERSATIONS_PER_LINKING_LIST, PROGRESS_STATES, PREFERENCE_KINDS, USAGE_LEVELS, VALUE_LEVELS, LINK_KINDS, MAX_READINGS, iso3, groupIdFor, emptyGroups, isIsoOrNull, textTarget, evidenceList, STORY_NARRATIVE_MAX, STORY_NARRATIVE_TARGET, STORY_RECAP_BUDGET, STORY_CHAPTER_MIN_BUDGET, STORY_CHARS_PER_WORD, STORY_REFUSAL_PARTS, FOCUS_ASK_CHARS, CONVERSATIONS_PER_QUERY, records, otherPassHash, focusAreaRecord, AREA_NAME_MAX, AREA_SENTENCE_MAX, requireDeviceId, GROUPING_BATCH, FOCUS_BATCH, CLOSED_STATES;
+var DATA_DIR2, LEDGER_DIR, AGENT_WRITTEN_PROMPTS_FILE, DAY_MS2, GOALS_STALE_MS, MAX_CONVERSATIONS_PER_LINKING_LIST, PROGRESS_STATES, PREFERENCE_KINDS, USAGE_LEVELS, VALUE_LEVELS, LINK_KINDS, MAX_READINGS, iso3, groupIdFor, emptyGroups, isIsoOrNull, textTarget, evidenceList, STORY_NARRATIVE_MAX, STORY_NARRATIVE_TARGET, STORY_RECAP_BUDGET, STORY_CHAPTER_MIN_BUDGET, STORY_CHARS_PER_WORD, STORY_REFUSAL_PARTS, CONVERSATIONS_PER_QUERY, records, otherPassHash, focusAreaRecord, AREA_NAME_MAX, AREA_SENTENCE_MAX, requireDeviceId, GROUPING_BATCH, FOCUS_BATCH, TITLE_BATCH, CLOSED_STATES;
 var init_request_groups = __esm({
   "src/services/work-view/request-groups.mjs"() {
     "use strict";
@@ -5771,6 +5902,7 @@ var init_request_groups = __esm({
     init_shared_file_hooks();
     init_work_state_status();
     init_atomic_json();
+    init_request_projection();
     DATA_DIR2 = process.env.CLAUDE_MEM_DATA_DIR || join11(homedir9(), ".claude-mem");
     LEDGER_DIR = join11(DATA_DIR2, "work-view");
     AGENT_WRITTEN_PROMPTS_FILE = "agent-written-prompts.json";
@@ -5795,7 +5927,6 @@ var init_request_groups = __esm({
     STORY_CHAPTER_MIN_BUDGET = 300;
     STORY_CHARS_PER_WORD = 6;
     STORY_REFUSAL_PARTS = 6;
-    FOCUS_ASK_CHARS = 400;
     CONVERSATIONS_PER_QUERY = 400;
     records = (database, ledger, groupIds, requests) => {
       const asks = openingAsks(database, ledger, groupIds.flatMap(requests.conversations));
@@ -5811,6 +5942,7 @@ var init_request_groups = __esm({
     };
     GROUPING_BATCH = 20;
     FOCUS_BATCH = GROUPING_BATCH;
+    TITLE_BATCH = GROUPING_BATCH;
     CLOSED_STATES = /* @__PURE__ */ new Set(["shipped", "abandoned"]);
   }
 });
@@ -5826,6 +5958,35 @@ init_expand_home();
 init_hook_constants();
 init_install_port();
 
+// src/shared/worker-url.ts
+var InvalidWorkerUrlError = class extends Error {
+  name = "InvalidWorkerUrlError";
+};
+function normalizeWorkerBaseUrl(raw) {
+  const value = raw.trim();
+  if (!value) return "";
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new InvalidWorkerUrlError("CLAUDE_MEM_WORKER_URL must be an absolute http(s) URL");
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new InvalidWorkerUrlError("CLAUDE_MEM_WORKER_URL must use http or https");
+  }
+  if (url.username || url.password || /[?#]/.test(url.href)) {
+    throw new InvalidWorkerUrlError("CLAUDE_MEM_WORKER_URL cannot include credentials, a query, or a fragment");
+  }
+  if (url.protocol === "http:" && !isLoopbackHostname(url.hostname)) {
+    throw new InvalidWorkerUrlError("CLAUDE_MEM_WORKER_URL must use https for non-loopback workers");
+  }
+  return url.toString().replace(/\/+$/, "");
+}
+function isLoopbackHostname(hostname2) {
+  const host = hostname2.toLowerCase().replace(/^\[|\]$/g, "");
+  return host === "localhost" || host.endsWith(".localhost") || host === "::1" || /^127(?:\.\d{1,3}){1,3}$/.test(host);
+}
+
 // src/shared/local-api-token.ts
 init_logger();
 var LOCAL_API_TOKEN_HEADER = "x-claude-mem-token";
@@ -5835,11 +5996,51 @@ function normalizeLocalApiToken(value) {
 function localApiTokenHeaders(token) {
   return token ? { [LOCAL_API_TOKEN_HEADER]: token } : {};
 }
-
-// src/shared/worker-url.ts
-function isLoopbackHostname(hostname2) {
-  const host = hostname2.toLowerCase().replace(/^\[|\]$/g, "");
-  return host === "localhost" || host.endsWith(".localhost") || host === "::1" || /^127(?:\.\d{1,3}){1,3}$/.test(host);
+function normalizeRemoteTokenHost(value) {
+  return typeof value === "string" ? value.trim() : "";
+}
+function comparableHostname(hostname2) {
+  const bare = hostname2.startsWith("[") && hostname2.endsWith("]") ? hostname2.slice(1, -1) : hostname2;
+  return bare.toLowerCase();
+}
+function localApiTokenHeadersFor(input) {
+  const token = normalizeLocalApiToken(input.token);
+  if (!token) return {};
+  let target;
+  try {
+    target = new URL(input.workerOrigin);
+  } catch {
+    return {};
+  }
+  if (isLoopbackHostname(target.hostname)) {
+    return input.workerOrigin === input.localOrigin ? localApiTokenHeaders(token) : {};
+  }
+  if (target.protocol !== "https:" && target.protocol !== "http:") return {};
+  const remote = normalizeRemoteTokenHost(input.remoteTokenHost);
+  if (!remote || remote !== input.configuredHost.trim()) return {};
+  if (comparableHostname(target.hostname) !== comparableHostname(remote)) return {};
+  if (target.protocol === "http:") {
+    if (!sameOrigin(target, input.localOrigin)) return {};
+    warnPlainHttpRemoteToken(target.origin);
+  }
+  return localApiTokenHeaders(token);
+}
+function sameOrigin(target, origin) {
+  try {
+    return target.origin === new URL(origin).origin;
+  } catch {
+    return false;
+  }
+}
+var plainHttpRemoteTokenOriginsWarned = /* @__PURE__ */ new Set();
+function warnPlainHttpRemoteToken(origin) {
+  if (plainHttpRemoteTokenOriginsWarned.has(origin)) return;
+  plainHttpRemoteTokenOriginsWarned.add(origin);
+  logger.warn(
+    "SECURITY",
+    `Sending the local API token to ${origin} over plain HTTP, because CLAUDE_MEM_LOCAL_API_TOKEN_REMOTE_HOST names that host. Anyone on the network path can read the header and use it on the worker's whole API. Set CLAUDE_MEM_WORKER_URL to the worker's https address unless this network is trusted.`,
+    { origin }
+  );
 }
 
 // src/integrations/harness-worker.ts
@@ -5863,7 +6064,7 @@ function harnessSetting(dataDir = dataDirectory()) {
     return process.env[key] || saved || fallback;
   };
 }
-function resolveHarnessWorkerUrl() {
+function resolveHarnessHostPortOrigin() {
   const dataDir = dataDirectory();
   const setting = harnessSetting(dataDir);
   const configuredHost = setting("CLAUDE_MEM_WORKER_HOST", "127.0.0.1");
@@ -5871,13 +6072,23 @@ function resolveHarnessWorkerUrl() {
   const port = setting("CLAUDE_MEM_WORKER_PORT", String(getDefaultWorkerPort(dataDir)));
   return "http://" + (host.includes(":") && !host.startsWith("[") ? "[" + host + "]" : host) + ":" + port;
 }
+function resolveHarnessWorkerUrl() {
+  return normalizeWorkerBaseUrl(harnessSetting()("CLAUDE_MEM_WORKER_URL", "")) || resolveHarnessHostPortOrigin();
+}
 function resolveHarnessAuthHeaders(baseUrl = resolveHarnessWorkerUrl()) {
-  const token = normalizeLocalApiToken(readHarnessSettingsFile(dataDirectory()).CLAUDE_MEM_LOCAL_API_TOKEN);
+  const settings2 = readHarnessSettingsFile(dataDirectory());
+  const token = normalizeLocalApiToken(settings2.CLAUDE_MEM_LOCAL_API_TOKEN);
   if (!token) return {};
   try {
-    const target = new URL(baseUrl);
-    if (target.origin !== new URL(resolveHarnessWorkerUrl()).origin) return {};
-    return isLoopbackHostname(target.hostname) ? localApiTokenHeaders(token) : {};
+    return localApiTokenHeadersFor({
+      token,
+      workerOrigin: new URL(baseUrl).origin,
+      // Host and port, never CLAUDE_MEM_WORKER_URL: a loopback URL there may be an SSH
+      // forward to another machine's worker, so it must not count as this machine's.
+      localOrigin: new URL(resolveHarnessHostPortOrigin()).origin,
+      configuredHost: harnessSetting()("CLAUDE_MEM_WORKER_HOST", "127.0.0.1"),
+      remoteTokenHost: typeof settings2.CLAUDE_MEM_LOCAL_API_TOKEN_REMOTE_HOST === "string" ? settings2.CLAUDE_MEM_LOCAL_API_TOKEN_REMOTE_HOST : ""
+    });
   } catch {
     return {};
   }
@@ -5895,14 +6106,14 @@ function withHarnessAuth(init, auth) {
 init_paths();
 init_SettingsDefaultsManager();
 init_request_groups();
-import { Database as Database2 } from "bun:sqlite";
+import { Database } from "bun:sqlite";
 import { existsSync as existsSync13 } from "node:fs";
 
 // src/services/work-view/shared-ledger-adapter.mjs
 init_request_groups();
 import { readFileSync as readFileSync10, readdirSync as readdirSync2, mkdirSync as mkdirSync4, renameSync as renameSync3, writeFileSync as writeFileSync3, unlinkSync as unlinkSync2, statSync as statSync7 } from "node:fs";
 import { join as join12 } from "node:path";
-import { createHash as createHash8 } from "node:crypto";
+import { createHash as createHash8, randomUUID as randomUUID3 } from "node:crypto";
 
 // src/services/work-view/agent-view.mjs
 init_request_projection();
@@ -6139,9 +6350,12 @@ function judgedStatusFor(recordedStatus, judgedState) {
   return status === recorded ? null : status;
 }
 
+// src/shared/platform-source.ts
+var GROK_BUILD_PLATFORM_SOURCE = "grok-build";
+
 // src/services/work-view/agent-view.mjs
 var PROJECT_KEY = (value) => String(value ?? "").replace(/[A-Z]/g, (c) => c.toLowerCase());
-var PLATFORMS = { codex: "Codex", claude: "Claude Code", gemini: "Gemini CLI", "gemini-cli": "Gemini CLI", "antigravity-cli": "Antigravity CLI", kimi: "Kimi", "hermes-cli": "Hermes", "pi-agent": "Pi" };
+var PLATFORMS = { codex: "Codex", claude: "Claude Code", gemini: "Gemini CLI", "gemini-cli": "Gemini CLI", "antigravity-cli": "Antigravity CLI", [GROK_BUILD_PLATFORM_SOURCE]: "Grok Build", kimi: "Kimi", "hermes-cli": "Hermes", "pi-agent": "Pi" };
 var platformLabel = (platform) => PLATFORMS[platform] ?? compactText(platform, 48) ?? "Unassigned";
 var stamp = (value) => Number.isFinite(Number(value)) && Number(value) > 0 ? new Date(Number(value)).toISOString() : null;
 var fingerprint = (value) => JSON.stringify(Object.entries(value).sort(([a], [b]) => a.localeCompare(b)));
@@ -6285,7 +6499,8 @@ function launchRequest(launch) {
   const text5 = launch.description ?? launch.prompt;
   return text5 ? { text: text5, source: "agent-launch", sourceId: launch.shared ? null : launch.toolUseId, url: launch.shared ? null : `/api/work-view/evidence/tool-use/${launch.toolUseId}` } : null;
 }
-function buildAgentView(state, records2, { now = Date.now(), workLimit = 240, activityLimit = 160, recentMs = 15 * 60 * 1e3, titleCache = {}, ledger = null, onProductFile = null, workStateLabels = null } = {}) {
+var DEFAULT_RECENT_ACTIVITY_MS = 15 * 60 * 1e3;
+function buildAgentView(state, records2, { now = Date.now(), workLimit = 240, activityLimit = 160, recentMs = DEFAULT_RECENT_ACTIVITY_MS, titleCache = {}, ledger = null, onProductFile = null, workStateLabels = null, localFiles = true, getProjectRoot } = {}) {
   const { calls = [], observations = [], summaries = [], sessions = [], prompts = [], agentLaunches = [], agentToolActivity = [] } = records2;
   const launches = readAgentLaunches(agentLaunches);
   const lastToolEpochs = new Map(agentToolActivity.map((row) => [lifecycleKey(row.platform_source, row.content_session_id, row.agent_id), Number(row.last_epoch) || 0]));
@@ -6416,7 +6631,8 @@ function buildAgentView(state, records2, { now = Date.now(), workLimit = 240, ac
     const original = prompt ? { source: "user-prompt", sourceId: prompt.id, url: `/api/work-view/evidence/prompt/${prompt.id}` } : null;
     if (summary && readableRequest(summary.request)) return { key, text: readableRequest(summary.request), source: "session-summary-request", sourceId: summary.id, url: `/api/work-view/evidence/summary/${summary.id}`, original };
     if (prompt && readableRequest(prompt.prompt_text)) return { key, text: readableRequest(prompt.prompt_text), ...original };
-    if ((number == null || number <= 1) && readableRequest(session.user_prompt)) return { key, text: readableRequest(session.user_prompt), source: "session-initial-request", sourceId: session.sharedOnly ? null : session.id, url: session.sharedOnly ? null : `/api/work-view/evidence/session/${session.id}` };
+    const opening = readableRequest(Object.hasOwn(session, "sharedOpeningPrompt") ? session.sharedOpeningPrompt : session.user_prompt);
+    if ((number == null || number <= 1) && opening) return { key, text: opening, source: "session-initial-request", sourceId: session.sharedOnly ? null : session.id, url: session.sharedOnly ? null : `/api/work-view/evidence/session/${session.id}` };
     return null;
   }
   function addActivity(group, entry) {
@@ -6580,7 +6796,7 @@ function buildAgentView(state, records2, { now = Date.now(), workLimit = 240, ac
     };
   }).sort((a, b) => String(b.presence.lastActivityAt ?? "").localeCompare(String(a.presence.lastActivityAt ?? "")));
   const recentActivity = activity.sort((a, b) => b.atEpoch - a.atEpoch).slice(0, activityLimit);
-  const requestProjection = buildHumanRequests({ agents, recentActivity }, records2, { titleCache, ledger, onProductFile });
+  const requestProjection = buildHumanRequests({ agents, recentActivity }, records2, { titleCache, ledger, onProductFile, localFiles, getProjectRoot });
   const { focusAreas, focusAreaIdByAnchor } = buildFocusAreas(state);
   return {
     version: 1,
@@ -6786,6 +7002,11 @@ function validateHumanCopy(output2, input) {
   return { title: copyText(output2.title, 100, "Request title"), summary: copyText(output2.summary, 240, "Request summary"), next: copyText(output2.next, 160, "Next step", true), ...Object.hasOwn(output2, "stage") ? { stage: copyText(output2.stage, 40, "Stage", true) } : {}, workstreams };
 }
 
+// src/services/prompt-import/transcript-origin.mjs
+function syncablePromptSql(column) {
+  return `(${column} IS NULL OR ${column} NOT GLOB 'transcript:*')`;
+}
+
 // src/services/work-view/shared-projection.mjs
 import { isIP } from "node:net";
 import { basename as basename7 } from "node:path";
@@ -6850,7 +7071,7 @@ var forbiddenKeys = /* @__PURE__ */ new Set(["__proto__", "constructor", "protot
 var string = (value, max = 12e3) => typeof value === "string" && value.length <= max;
 var optional = (value, check) => value == null || check(value);
 var date = (value) => string(value, 40) && Number.isFinite(Date.parse(value));
-var epoch = (value) => typeof value === "number" && Number.isFinite(value) && value >= 0;
+var epoch = (value) => typeof value === "number" && value >= 0 && Number.isFinite(new Date(value).getTime());
 var list = (value, check, max = 512) => Array.isArray(value) && value.length <= max && value.every(check);
 var preferenceKinds = ["directive", "correction", "praise", "frustration"];
 var quote = (value) => object2(value) && string(value.quote, 4e3) && optional(value.at, date);
@@ -6922,6 +7143,7 @@ function get(database, sql, args) {
 }
 function stableEvidenceRef(database, kind, id, deviceId) {
   if (id == null) return null;
+  if (database.stableEvidenceRef) return database.stableEvidenceRef(kind, id);
   if (kind === "session") {
     const row2 = get(database, "SELECT platform_source, content_session_id FROM sdk_sessions WHERE id = ?", [id]);
     const key = conversationKey(row2);
@@ -6942,6 +7164,7 @@ function stableEvidenceRef(database, kind, id, deviceId) {
 }
 function resolveEvidenceRef(database, ref, deviceId) {
   if (!ref || typeof ref !== "object") return null;
+  if (database.resolveEvidenceRef) return database.resolveEvidenceRef(ref);
   if (ref.kind === "session") {
     let tuple;
     try {
@@ -7046,13 +7269,35 @@ function groupRecords(rows, keyOf) {
 function buildSharedProjectionUpdates(database, { ledger, records: records2 = {}, view = {}, deviceId, copyEntries = {} } = {}) {
   if (!deviceId) return [];
   decorateSharedView(view, { database, deviceId, records: records2 });
+  const liveOpenings = /* @__PURE__ */ new Map();
+  const liveOpening = (key) => {
+    if (!conversation(key)) return null;
+    if (!liveOpenings.has(key)) {
+      const [, platform, contentId] = JSON.parse(key);
+      const prompt = get(database, `SELECT p.prompt_text FROM sdk_sessions s JOIN user_prompts p ON p.session_db_id = s.id
+        WHERE s.platform_source = ? AND s.content_session_id = ? AND p.prompt_text = s.user_prompt
+          AND p.origin_device_id IS NULL AND ${syncablePromptSql("p.native_prompt_id")} LIMIT 1`, [platform, contentId]);
+      liveOpenings.set(key, requestText(prompt?.prompt_text));
+    }
+    return liveOpenings.get(key);
+  };
   const updates = [];
   const add = (kind, key, value) => updates.push({ kind, key, value });
   for (const [id, group] of Object.entries(ledger?.groups?.groups ?? {})) {
     const members = Object.entries(ledger.groups.conversations ?? {}).filter(([, groupId]) => groupId === id).map(([key]) => key).sort();
     const suggestions = Object.fromEntries(Object.entries(ledger.groups.suggestions ?? {}).filter(([, suggestion]) => suggestion.requestId === id).map(([key, value]) => [key, pick(value, ["requestId", "confidence", "evidence", "judge", "at", "status", "resolvedAt"])]));
     const portableGroup = pick(group, ["title", "anchor", "projectRoot", "rootNamed", "product", "links", "decidedAt"]);
-    if (group.anchorAsk) portableGroup.anchorAsk = pick(group.anchorAsk, ["text", "source", "sourceId", "url", "promptNumber", "atEpoch"]);
+    const ask = group.anchorAsk;
+    if (ask) {
+      let text5 = ask.source === "session-summary-request" ? ask.text : null;
+      if (ask.source === "user-prompt") {
+        const prompt = get(database, `SELECT prompt_text FROM user_prompts WHERE id = ? AND origin_device_id IS NULL
+          AND ${syncablePromptSql("native_prompt_id")}`, [ask.sourceId]);
+        text5 = requestText(prompt?.prompt_text);
+      } else if (ask.source === "session-initial-request") text5 = liveOpening(group.anchor);
+      if (text5 && text5 === ask.text) portableGroup.anchorAsk = pick(ask, ["text", "source", "sourceId", "url", "promptNumber", "atEpoch"]);
+      else if (copiesOpeningAsk(portableGroup.title, ask.text)) portableGroup.title = "Untitled request";
+    }
     add("group", id, portableWorkValue(database, { group: portableGroup, members, suggestions }, deviceId));
   }
   for (const [key, ignored] of Object.entries(ledger?.groups?.ignored ?? {})) add("ignored", key, portableWorkValue(database, ignored, deviceId));
@@ -7133,7 +7378,7 @@ function buildSharedProjectionUpdates(database, { ledger, records: records2 = {}
     const sessionValue = Object.fromEntries(sessionFields.map((field) => [field, clean2(session[field])]));
     sessionValue.project = sharedProjectKey(sessionValue.project);
     const rejectedOpening = prompts.some((prompt) => ledger?.agentWrittenPromptIds?.has(prompt.id) && (prompt.prompt_number === 1 || prompt.prompt_text === session.user_prompt));
-    sessionValue.user_prompt = rejectedOpening ? null : requestText(session.user_prompt, 1200);
+    sessionValue.user_prompt = !rejectedOpening && session.user_prompt ? liveOpening(key) : null;
     if (typeof sessionValue.custom_title === "string") sessionValue.custom_title = sessionValue.custom_title.slice(0, 120);
     add("provenance", key, { session: sessionValue, attributions, products, launches, activity });
   }
@@ -7234,9 +7479,11 @@ function applySharedProjection(database, shared, { ledger = null, records: recor
     else if (record.kind === "provenance" && !record.deleted && value?.session) {
       const key = conversationKey(value.session);
       if (key !== record.key) continue;
+      const facts = pick(value.session, sessionFields);
       let session = merged.sessions.find((row) => conversationKey(row) === key);
-      if (session) session = record.writer === deviceId ? { ...value.session, ...session } : { ...session, ...value.session };
-      else session = { ...value.session, id: `shared:${key}`, sharedOnly: true };
+      if (session) session = record.writer === deviceId ? { ...facts, ...session } : { ...session, ...facts };
+      else session = { ...facts, id: `shared:${key}`, sharedOnly: true };
+      session.sharedOpeningPrompt = facts.user_prompt ?? null;
       merged.sessions = merged.sessions.filter((row) => conversationKey(row) !== key);
       merged.sessions.push(session);
       for (const attribution of value.attributions ?? []) {
@@ -7251,7 +7498,7 @@ function applySharedProjection(database, shared, { ledger = null, records: recor
   const referencedGroups = new Set(Object.values(next.groups.conversations));
   for (const groupId of Object.keys(next.groups.groups)) if (!referencedGroups.has(groupId)) delete next.groups.groups[groupId];
   for (const session of merged.sessions) if ((merged.prompts ?? []).some((prompt) => prompt.session_db_id === session.id && next.agentWrittenPromptIds.has(prompt.id) && (prompt.prompt_number === 1 || prompt.prompt_text === session.user_prompt))) excludedOpenings.add(conversationKey(session));
-  merged.sessions = merged.sessions.map((session) => excludedOpenings.has(conversationKey(session)) ? { ...session, user_prompt: null } : session);
+  merged.sessions = merged.sessions.map((session) => excludedOpenings.has(conversationKey(session)) ? { ...session, user_prompt: null, sharedOpeningPrompt: null } : session);
   merged.prompts = (merged.prompts ?? []).filter((prompt) => !next.agentWrittenPromptIds.has(prompt.id));
   return { ledger: next, records: merged, copyEntries, diagnostics };
 }
@@ -7566,6 +7813,7 @@ function foldSharedRows(items, context, includeHistory, values2, previousValues 
     const recordOf = (summary) => {
       const entry = full(summary);
       return {
+        ...context.sourceId ? { sourceId: context.sourceId(summary) } : {},
         kind: entry.kind,
         key: entry.key,
         value: entry.value,
@@ -7734,12 +7982,20 @@ function load(path4) {
     throw error;
   }
 }
+function observedFileHash(path4) {
+  try {
+    return digest(load(path4));
+  } catch (error) {
+    if (!(error instanceof SyntaxError)) throw error;
+    return `unparsed:${createHash8("sha256").update(readFileSync10(path4)).digest("hex")}`;
+  }
+}
 function rawWrite(path4, value) {
   mkdirSync4(join12(path4, ".."), { recursive: true });
-  const temp = `${path4}.${process.pid}.shared.tmp`;
+  const temp = `${path4}.${randomUUID3()}.shared.tmp`;
   try {
     writeFileSync3(temp, `${JSON.stringify(value, null, 2)}
-`, { mode: 384 });
+`, { mode: 384, flag: "wx" });
     renameSync3(temp, path4);
   } finally {
     try {
@@ -7790,7 +8046,7 @@ var SharedLedgerAdapter = class {
     const bases = Object.fromEntries([...knownKeys].map((key) => [key, shared.records.get(key)?.hash ?? prior.bases[key] ?? null]));
     this.db.prepare(`INSERT INTO my_work_file_state(name, observed_hash, bases, keys_json, pending_json, pending_delete) VALUES(?, ?, ?, ?, ?, ?)
       ON CONFLICT(name) DO UPDATE SET observed_hash=excluded.observed_hash, bases=excluded.bases,
-      keys_json=excluded.keys_json, pending_json=excluded.pending_json, pending_delete=excluded.pending_delete`).run(name, pending ? prior.observed_hash ?? digest(load(join12(this.directory, name))) : digest(value), JSON.stringify(bases), JSON.stringify(keys), pending ? JSON.stringify(value) : null, Number(pending && pendingDelete));
+      keys_json=excluded.keys_json, pending_json=excluded.pending_json, pending_delete=excluded.pending_delete`).run(name, pending ? prior.observed_hash ?? observedFileHash(join12(this.directory, name)) : digest(value), JSON.stringify(bases), JSON.stringify(keys), pending ? JSON.stringify(value) : null, Number(pending && pendingDelete));
   }
   localLedger() {
     try {
@@ -8165,7 +8421,8 @@ init_shared_file_hooks();
 init_SettingsDefaultsManager();
 init_settings_document();
 init_shared_records();
-import { randomUUID as randomUUID3 } from "node:crypto";
+init_logger();
+import { randomUUID as randomUUID4 } from "node:crypto";
 function validIdentity(value) {
   if (!value.trim() || Buffer.byteLength(value, "utf8") > 128 || value.includes("\0")) {
     throw new Error("Local device identity is invalid");
@@ -8189,10 +8446,17 @@ function ensureLocalDeviceIdentity(db, settingsPath, configuredId = "") {
       if (!/no such (table|column)/i.test(String(error.message))) throw error;
     }
     if (identities.size > 1) throw new Error("Local device identity conflicts with saved work; reconnect or restore the original identity before writing");
-    const deviceId = [...identities][0] ?? randomUUID3();
+    const deviceId = [...identities][0] ?? randomUUID4();
     if (settingsId !== deviceId) {
       const result = updateSettingsDocument(settingsPath, { CLAUDE_MEM_CLOUD_SYNC_DEVICE_ID: deviceId }, SettingsDefaultsManager.getAllDefaults());
-      if (result.status === "refused") throw result.error instanceof Error ? result.error : new Error("Local device identity could not be saved");
+      if (result.status === "refused") {
+        const cause = result.error instanceof Error ? result.error : new Error(String(result.error));
+        if (pinned) {
+          logger.warn("DB", "Could not save the local device identity to settings; using the identity saved in the database", { settingsPath }, cause);
+        } else {
+          throw new Error(`Could not save the local device identity to ${settingsPath}: ${cause.message}. If this file is not valid JSON, repair or delete it, then restart claude-mem.`, { cause });
+        }
+      }
     }
     if (!pinned) db.query("INSERT INTO local_work_view_identity(singleton,device_id) VALUES(1,?)").run(deviceId);
     return deviceId;
@@ -8218,9 +8482,9 @@ var localDeviceId = settings.CLAUDE_MEM_CLOUD_SYNC_DEVICE_ID ?? "";
 var sharedDatabase = null;
 var stopSharedWriter = null;
 var command = process.argv[2];
-var writesLedger = ["apply", "record-progress", "record-story"].includes(command) || command === "judge" && process.argv.includes("--apply");
+var writesLedger = ["apply", "record-progress", "record-titles", "record-story"].includes(command) || command === "judge" && process.argv.includes("--apply");
 if (settings.CLAUDE_MEM_WORK_VIEW_SHARED_STATE === "true" && writesLedger && existsSync13(join13(resolveDataDir(), "claude-mem.db"))) {
-  sharedDatabase = new Database2(join13(resolveDataDir(), "claude-mem.db"), { readwrite: true, create: false });
+  sharedDatabase = new Database(join13(resolveDataDir(), "claude-mem.db"), { readwrite: true, create: false });
   localDeviceId = ensureLocalDeviceIdentity(sharedDatabase, join13(resolveDataDir(), "settings.json"), localDeviceId);
   const adapter = new SharedLedgerAdapter(sharedDatabase, { directory: join13(resolveDataDir(), "work-view"), deviceId: localDeviceId });
   stopSharedWriter = registerSharedFileWriter(join13(resolveDataDir(), "work-view"), (name, value) => adapter.beforeWrite(name, value));

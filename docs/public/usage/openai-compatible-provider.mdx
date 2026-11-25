@@ -36,8 +36,12 @@ This provider has its own settings keys. The request body is `model`,
 `messages`, `temperature`, `max_tokens`, and `reasoning: { enabled: false }`
 by default, so a reasoning model cannot spend the output cap thinking and
 return an empty observation. Set `CLAUDE_MEM_OPENAI_COMPAT_REASONING` to `on`
-to leave reasoning to the endpoint. A strict server (vLLM in particular) that
-rejects the `reasoning` field gets the request once more without it. `max_tokens`
+to leave observer reasoning to the endpoint. To request a specific effort on
+observer and API-agent calls, set `CLAUDE_MEM_OPENAI_COMPAT_REASONING_EFFORT`.
+For example, set it to `high` to send `{"reasoning_effort":"high"}`. Choose a
+value the model supports. OpenCode Go's `beam-free` lists `low` through `max`
+and can continue reasoning when sent `none`. A strict server that rejects
+the reasoning field as unknown gets the request once more without it. `max_tokens`
 is `CLAUDE_MEM_OBSERVER_MAX_OUTPUT_TOKENS` (4096 by default); a model that only
 accepts `max_completion_tokens` gets the request again with that field.
 
@@ -99,6 +103,7 @@ endpoint or model you pinned yourself.
 | `nvidia-nim` | `https://integrate.api.nvidia.com/v1` | yes |
 | `orcarouter` | `https://api.orcarouter.ai/v1` | yes |
 | `api-route` | `https://global.api-route.com/v1` | yes |
+| `modelgo` | `https://api.modelgo.ai/v1` | yes |
 | `opper` | `https://api.opper.ai/v3/compat` | yes |
 | `atlascloud` | `https://api.atlascloud.ai/v1` | yes |
 | `popnow` | `https://api.popnow.ai/v1` | yes |
@@ -110,6 +115,8 @@ endpoint or model you pinned yourself.
 | `hopbase` | `https://api.hop-base.com/v1` | yes |
 | `trustedrouter` | `https://api.trustedrouter.com/v1` | yes |
 | `atmorouter` | `https://atmorouter.dev/v1` | yes |
+| `worldrouter` | `https://inference-api.worldrouter.ai/v1` | yes |
+| `aigrow` | `https://aigrow.gg/v1` | yes |
 | `deepseek` | `https://api.deepseek.com/v1` | yes |
 | `opencode-go` | `https://opencode.ai/zen/go/v1` | yes |
 | `opencode-zen` | `https://opencode.ai/zen/v1` | yes |
@@ -156,7 +163,8 @@ work.
 | `CLAUDE_MEM_OPENAI_COMPAT_BASE_URL` | preset's | OpenAI-compatible base URL. `/chat/completions` is appended if absent. Settings file or environment only |
 | `CLAUDE_MEM_OPENAI_COMPAT_MODEL` | preset's | Model id, passed verbatim |
 | `CLAUDE_MEM_OPENAI_COMPAT_OBSERVATION_BATCH_SIZE` | `1` | Queued tool events per observer request (1–32); see [Observation batching](#observation-batching) |
-| `CLAUDE_MEM_OPENAI_COMPAT_REASONING` | `''` (= off) | `off` sends `reasoning: { enabled: false }` on every request. `on` leaves reasoning to the endpoint |
+| `CLAUDE_MEM_OPENAI_COMPAT_REASONING` | `''` (= off) | `off` asks the observer to disable reasoning using the preset’s wire format. `on` leaves it to the endpoint |
+| `CLAUDE_MEM_OPENAI_COMPAT_REASONING_EFFORT` | empty | Optional `none`, `low`, `medium`, `high`, `xhigh`, or `max`. An explicit value overrides the observer toggle and the API agent’s preset default. Empty keeps their existing behavior |
 | `CLAUDE_MEM_OPENAI_COMPAT_API_KEY` | `''` | API key. Also read from `OPENAI_COMPAT_API_KEY` in `~/.claude-mem/.env` |
 | `CLAUDE_MEM_OPENAI_COMPAT_API_KEYS` | `''` | Extra keys for rotation — see [multi-key rotation](/usage/multi-key-rotation) |
 
@@ -319,6 +327,27 @@ Alternatively, store the key as `OPENAI_COMPAT_API_KEY` in
 `~/.claude-mem/.env`. Restart the worker after changing the configuration.
 Without a model or key, this provider is unconfigured and dispatch falls
 through to Claude.
+
+## ModelGo
+
+[ModelGo](https://modelgo.ai) exposes OpenAI-compatible chat completions and
+an authenticated model catalog behind one `mgk_` API key. The preset does not
+choose a default model because the logical model names available to each key
+depend on its account policy. List them with `GET https://api.modelgo.ai/v1/models`
+and select one that supports `/chat/completions`.
+
+```json
+{
+  "CLAUDE_MEM_PROVIDER": "openai-compatible",
+  "CLAUDE_MEM_OPENAI_COMPAT_PRESET": "modelgo",
+  "CLAUDE_MEM_OPENAI_COMPAT_API_KEY": "mgk_...",
+  "CLAUDE_MEM_OPENAI_COMPAT_MODEL": "<your chat-completions model id>"
+}
+```
+
+Create a key in the [ModelGo console](https://console.modelgo.ai). Alternatively,
+store it as `OPENAI_COMPAT_API_KEY` in `~/.claude-mem/.env`. Restart the worker
+after changing the configuration.
 
 ## Opper
 
@@ -528,6 +557,48 @@ Setup notes are in [the AtmoRouter docs](https://atmorouter.dev/docs/quickstart)
   "CLAUDE_MEM_OPENAI_COMPAT_PRESET": "atmorouter",
   "CLAUDE_MEM_OPENAI_COMPAT_API_KEY": "<your AtmoRouter key>",
   "CLAUDE_MEM_OPENAI_COMPAT_MODEL": "zai/glm-5.3-flash"
+}
+```
+
+## WorldRouter
+
+[WorldRouter](https://www.worldrouter.ai) is an OpenAI-compatible API gateway
+for models from DeepSeek, Anthropic, OpenAI, Google, Moonshot, MiniMax, Zhipu
+and others behind one key. Model ids are unprefixed, such as `deepseek-v4-flash`
+(the preset's default) or `claude-haiku-5-5`, and are passed verbatim. The
+catalog, with prices, is at [worldrouter.ai/models](https://www.worldrouter.ai/models);
+`GET https://inference-api.worldrouter.ai/v1/models` lists the same ids for
+your key. Setup notes are in
+[the WorldRouter quickstart](https://www.worldrouter.ai/docs/quickstart).
+
+```json
+{
+  "CLAUDE_MEM_PROVIDER": "openai-compatible",
+  "CLAUDE_MEM_OPENAI_COMPAT_PRESET": "worldrouter",
+  "CLAUDE_MEM_OPENAI_COMPAT_API_KEY": "<your WorldRouter key>",
+  "CLAUDE_MEM_OPENAI_COMPAT_MODEL": "deepseek-v4-flash"
+}
+```
+
+To run extraction on a newer model, set
+`CLAUDE_MEM_OPENAI_COMPAT_MODEL` to `gemini-4-neon`. It costs more per token
+than the default, which matters because extraction runs on every tool use.
+
+## AIGROW
+
+[AIGROW](https://aigrow.gg) sells prepaid API credit for Claude, GPT, Gemini,
+Grok, Qwen and Kimi models on one key, over the OpenAI format at
+`https://aigrow.gg/v1`. Model ids are unprefixed, such as `claude-haiku-5.5`
+(the preset's default) or `gemini-3.8-flash`, and are passed verbatim.
+`GET https://aigrow.gg/v1/models` lists every id with its per-token price and
+needs no key; prices are also at [aigrow.gg/ai-api](https://aigrow.gg/ai-api).
+
+```json
+{
+  "CLAUDE_MEM_PROVIDER": "openai-compatible",
+  "CLAUDE_MEM_OPENAI_COMPAT_PRESET": "aigrow",
+  "CLAUDE_MEM_OPENAI_COMPAT_API_KEY": "<your AIGROW key>",
+  "CLAUDE_MEM_OPENAI_COMPAT_MODEL": "claude-haiku-5.5"
 }
 ```
 

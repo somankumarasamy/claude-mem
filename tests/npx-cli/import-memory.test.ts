@@ -63,6 +63,28 @@ const supermemoryArgs = ['--from', 'supermemory', '--source-account', 'fixture-a
 const mem0Page = (...rows: unknown[]) => () => ({ count: rows.length, next: null, results: rows });
 
 describe('provider import contracts', () => {
+  test('nullable Mem0 lifecycle imports and preserves original provenance', () => {
+    const source = { ...row(), lifecycle_state: null };
+    const plan = planImport([source], mem0);
+    expect(plan.notes).toHaveLength(1);
+    expect(plan.skipped).toBe(0);
+    expect((plan.notes[0].metadata.importSource as { record: unknown }).record).toEqual(source);
+    expect(source.lifecycle_state).toBeNull();
+  });
+  test('nullable lifecycle still skips replaced and expired memories', () => {
+    const plan = planImport([
+      { ...row('replaced-null'), lifecycle_state: null, replaced_by: 'replacement' },
+      { ...row('expired-null'), lifecycle_state: null, expiration_date: '2020-01-01' },
+    ], mem0);
+    expect(plan.notes).toHaveLength(0);
+    expect(plan.skipped).toBe(2);
+  });
+  test('nullable lifecycle exception does not accept other invalid values', () => {
+    for (const lifecycle_state of ['', false, 0, {}, []]) {
+      expect(() => planImport([{ ...row(), lifecycle_state }], mem0)).toThrow('lifecycle');
+    }
+  });
+
   test('Mem0 uses a scoped read POST, sequential pages and no supplied next URL', async () => {
     const requests: Array<{ url: string; init?: RequestInit }> = [];
     const responses = [{ count: 2, next: 'https://other.invalid/steal', previous: null, results: [row()] }, { count: 2, next: null, previous: 'ignored', results: [row('m2')] }];
@@ -264,6 +286,20 @@ describe('provider import contracts', () => {
     expect(performance.now() - started).toBeLessThan(10_000);
     expect(run.vendorRequests).toHaveLength(1);
     expect(run.workerRequests).toHaveLength(1);
+  });
+  test('dry-run previews the source without reading the worker API deadline', async () => {
+    const preview = await runCommand([...mem0Args, '--dry-run'], mem0Page(row()), undefined, { CLAUDE_MEM_API_TIMEOUT_MS: 'soon' });
+    expect(preview.error).toBe('');
+    expect(preview.lines).toContain('1 read; 0 skipped; 1 ready to import.');
+    expect(preview.lines).toContain('Dry run complete. No memories were written.');
+    expect(preview.vendorRequests).toHaveLength(1);
+    expect(preview.workerRequests).toHaveLength(0);
+  });
+  test('dry-run still rejects an explicitly invalid source deadline before any request', async () => {
+    const invalid = await runCommand([...mem0Args, '--dry-run', '--timeout-ms', 'soon'], mem0Page(row()));
+    expect(invalid.error).toContain('--timeout-ms must be between');
+    expect(invalid.vendorRequests).toHaveLength(0);
+    expect(invalid.workerRequests).toHaveLength(0);
   });
   test('an invalid worker API deadline stops the import before any request, instead of a logged warning', async () => {
     const invalid = await runCommand(mem0Args, mem0Page(row()), undefined, { CLAUDE_MEM_API_TIMEOUT_MS: 'soon' });

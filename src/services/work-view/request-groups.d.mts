@@ -22,7 +22,7 @@ export function groupIdFor(anchorConversationKey: string): string;
 export function refreshNeeds(options: { dir?: string; database: LedgerDatabase; now?: number; days?: number; localDeviceId: string }): RefreshNeeds;
 export function writeJsonAtomic(path: string, value: unknown): void;
 export function readLedger(dir?: string): Record<string, any>;
-export function readCandidates(database: LedgerDatabase, options: { sinceEpoch?: number; conversationKeys?: string[] | null; fullAsks?: boolean; excludedPromptIds?: Set<number> | null }): any[];
+export function readCandidates(database: LedgerDatabase, options: { sinceEpoch?: number; conversationKeys?: string[] | null; fullAsks?: boolean; recentAsks?: boolean; excludedPromptIds?: Set<number> | null }): any[];
 export function ledgerSignature(dir?: string): string;
 /** The decisions `apply` takes, merged into `stored` with projects and first asks read from the database; not written. */
 export function applyDecisions(stored: Record<string, any> | null, decisions: unknown, options: { database: LedgerDatabase; now?: number; excludedPromptIds?: Set<number> | null; enrichGroupIds?: string[] | null }): Record<string, any>;
@@ -51,6 +51,18 @@ export interface FocusInput { areas: FocusAreaRecord[]; dismissed: FocusAreaReco
 export interface OtherInput { areas: FocusAreaRecord[]; dismissed: FocusAreaRecord[]; other: FocusRequestRecord[]; due: boolean }
 export const GROUPING_BATCH: number;
 export const FOCUS_BATCH: number;
+export const TITLE_BATCH: number;
+/** The title code gives a request it starts (the judge, a declined suggestion): the first sentence of its opening ask,
+ * cut as grouping-input shows the ask, copied. */
+export function placeholderTitleFromAsk(askText: string | null | undefined): string;
+/** Whether a title copies the opening ask: its placeholder, or words the ask starts with. */
+export function copiesOpeningAsk(title: string, askText: string | null | undefined): boolean;
+/** Whether a request still shows a title copied from its opening ask. */
+export function hasPlaceholderTitle(group: { title: string; anchorAsk?: { text?: string | null } | null }): boolean;
+/** title-input: requests still titled with their placeholder, as the focus step reads them, one batch at a time. */
+export function titleInput(ledger: Record<string, any>, database: LedgerDatabase, options?: { limit?: number }): { requests: FocusRequestRecord[]; remaining: number };
+/** coerce: the refresh's one retry drops a refused title or an unnamed request instead of refusing the whole answer. */
+export function validateTitleAnswer(answer: unknown, input: { requests: Array<Pick<FocusRequestRecord, 'groupId' | 'title' | 'firstAsk'>> }, options?: { coerce?: boolean }): { titles: Array<{ groupId: string; title: string }> };
 export function focusBasis(ledger: Record<string, any>, groupId: string): string;
 export function focusInput(ledger: Record<string, any>, focus: ReturnType<typeof import('./my-focus.mjs').buildFocusAreas>, localDeviceId: string, database: LedgerDatabase, options?: { limit?: number }): FocusInput;
 export function otherInput(ledger: Record<string, any>, focus: ReturnType<typeof import('./my-focus.mjs').buildFocusAreas>, localDeviceId: string, database: LedgerDatabase): OtherInput;
@@ -62,4 +74,22 @@ export interface GroupingInput {
   proposedLinks: Array<{ kind: string; conversations: string[]; evidence: string; groups: string[] }>;
   remaining: number;
 }
-export function validateGroupingAnswer<T>(answer: T, input: GroupingInput): T;
+/** coerce: the refresh's one retry cuts what would be refused, naming each changed group or ignore entry in coercedFields. */
+export function validateGroupingAnswer<T>(answer: T, input: GroupingInput, options?: { coerce?: boolean; coercedFields?: Set<string> }): T;
+export interface StoryPreference { preference: string; kind: string; supportCount: number; quotes: Array<{ quote: string; at: string | null }> }
+export interface ValidatedStory { narrative: string; preferences: StoryPreference[] }
+export function validateStory(story: any): ValidatedStory;
+export function trimStoryPreferences(story: any, coercedFields?: Set<string>): any;
+export interface StoryPart { part: string; chars: number; words: number; budgetChars: number; budgetWords: number; overBudgetChars: number }
+export interface StoryInput {
+  groups: number; update: boolean; narrativeTarget: number; narrativeLimit: number;
+  previousNarrativeChars: number; roomChars: number; condenseChars: number;
+  previousParts: StoryPart[]; mergeOldestChapters: number;
+  reviews: any[];
+  previousStory: (Record<string, any> & { narrative: string; preferences: any[] }) | null;
+}
+export function storyInput(groups: number, reviews: any[], story: (Record<string, any> & { narrative: string; preferences?: any[]; writtenAt?: string }) | null): StoryInput;
+export function applyGroupDecisions(
+  stored: Record<string, unknown>, decisions: { groups: Array<Record<string, unknown>>; ignored?: string[] },
+  now?: number, options?: { projectOf?: Map<string, string>; getProjectRoot?: (project: unknown) => string | null },
+): Record<string, unknown>;

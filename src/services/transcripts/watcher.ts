@@ -1,6 +1,6 @@
 import { createHash } from 'crypto';
 import { closeSync, existsSync, fstatSync, openSync, readSync, statSync, watch as fsWatch } from 'fs';
-import { open } from 'fs/promises';
+import { open, stat as statAsync } from 'fs/promises';
 import { basename, join, resolve as resolvePath, sep as pathSep } from 'path';
 import { logger } from '../../utils/logger.js';
 import { expandHomePath } from './config.js';
@@ -52,6 +52,19 @@ const NEW_TRANSCRIPT_REPLAY_MAX_BYTES = 256 * 1024;
  * event loop back between them.
  */
 const MAX_BYTES_PER_PASS = 4 * 1024 * 1024;
+/**
+ * The largest JSONL record the tailer holds. An unterminated record is kept
+ * across passes until its newline arrives, so without a ceiling a runaway
+ * writer or a corrupt transcript grows worker memory without bound. A record
+ * over the cap is skipped whole and logged at WARN with its offset and size.
+ *
+ * Measured 2026-11-21 on the maintainer's machine by splitting every file on
+ * newlines and recording each record's byte length: 1.2 M Codex rollout
+ * records (~/.codex/sessions, .jsonl and .zst) peaked at 44.17 MiB, 73 of them
+ * above 8 MiB; 2.1 M Claude Code records (~/.claude/projects) peaked at
+ * 25.99 MiB. 64 MiB sits above every measured record with room for growth.
+ */
+export const MAX_RECORD_BYTES = 64 * 1024 * 1024;
 
 /** The startAtEnd frame scan of a zstd file walks this many bytes of frames between yields. */
 const RESUME_SCAN_BYTES_PER_STEP = 16 * 1024 * 1024;
@@ -63,6 +76,23 @@ const RESUME_SCAN_BYTES_PER_STEP = 16 * 1024 * 1024;
  * milliseconds can raise no event on it.
  */
 const WATCH_ROOT_SETTLE_MS = 100;
+
+/**
+ * How often already-tailed transcripts are checked for bytes fs.watch did not
+ * report. Bun on macOS delivers no fs.watch event while another process
+ * appends to a file it keeps open (Codex Desktop holds a rollout open for the
+ * life of the thread), and the recursive root watch stays quiet until that
+ * process closes the file, so poke-on-root-event (#2192) never runs.
+ * Only files that already have a tailer are visited. Nothing is scanned into
+ * existence, and bytes already covered by readOffset are not read again.
+ *
+ * Why 3000 ms: #6283 asks for appended lines to be processed "within seconds",
+ * as under Node. The reporter's 15 s chmod workaround measured an 8.3 s lag, so
+ * the poll must run well under that; 3 s keeps the worst-case lag near 3 s.
+ * Each tick awaits one stat at a time (see pollTailedAppends), so a large
+ * history of tailed files lengthens the tick without blocking the event loop.
+ */
+const TAILED_APPEND_POLL_MS = 3000;
 
 // A bulk backfill can walk hundreds of files and tens of thousands of lines on
 // the Bun event loop that also serves the worker's HTTP API. Awaiting line
@@ -294,6 +324,15 @@ class FileTailer {
     this.requestRead();
   }
 
+  /** True when the file ends past the bytes already read. A missing file does not. */
+  async hasBytesPastReadOffset(): Promise<boolean> {
+    try {
+      return (await statAsync(this.filePath)).size > this.tailState.readOffset;
+    } catch {
+      return false;
+    }
+  }
+
   private requestRead(): void {
     if (this.closed) return;
     if (this.readTask) {
@@ -410,13 +449,27 @@ class FileTailer {
         this.checkpoint(this.tailState.offset);
         return;
       }
-      const tail = chunk.subarray(lineStart, newline);
-      const bytes = this.pendingRecordParts.length
-        ? Buffer.concat([...this.pendingRecordParts, tail], this.pendingRecordBytes + tail.length)
-        : tail;
+      // The record runs from the checkpoint to this newline, however many
+      // passes it took to arrive, so the cap does not depend on write timing.
+      const recordStartOffset = this.tailState.offset;
+      const recordBytes = readFrom + newline - recordStartOffset;
+      let line: string | null = null;
+      if (recordBytes > MAX_RECORD_BYTES) {
+        logger.warn('TRANSCRIPT', 'Skipped a transcript record larger than the record cap', {
+          file: this.filePath,
+          capBytes: MAX_RECORD_BYTES,
+          recordStartOffset,
+          skippedBytes: recordBytes,
+        });
+      } else {
+        const tail = chunk.subarray(lineStart, newline);
+        const bytes = this.pendingRecordParts.length
+          ? Buffer.concat([...this.pendingRecordParts, tail], this.pendingRecordBytes + tail.length)
+          : tail;
+        line = bytes.toString('utf8').trim() || null;
+      }
       this.pendingRecordParts = [];
       this.pendingRecordBytes = 0;
-      const line = bytes.toString('utf8').trim();
       if (line) {
         try {
           await this.onLine(line);
@@ -433,9 +486,25 @@ class FileTailer {
     }
 
     if (lineStart < chunk.length) {
-      const tail = lineStart === 0 ? chunk : Buffer.from(chunk.subarray(lineStart));
-      this.pendingRecordParts.push(tail);
-      this.pendingRecordBytes += tail.length;
+      const recordStartOffset = this.tailState.offset;
+      const heldBytes = this.tailState.readOffset - recordStartOffset;
+      if (heldBytes <= MAX_RECORD_BYTES) {
+        const tail = lineStart === 0 ? chunk : Buffer.from(chunk.subarray(lineStart));
+        this.pendingRecordParts.push(tail);
+        this.pendingRecordBytes += tail.length;
+      } else if (readFrom - recordStartOffset <= MAX_RECORD_BYTES) {
+        // This pass took the unterminated record over the cap. Drop what is
+        // held instead of growing it; the record is skipped when its newline
+        // arrives, and the cursor stays at its start until then.
+        this.pendingRecordParts = [];
+        this.pendingRecordBytes = 0;
+        logger.warn('TRANSCRIPT', 'Transcript record passed the record cap; it will be skipped when it ends', {
+          file: this.filePath,
+          capBytes: MAX_RECORD_BYTES,
+          recordStartOffset,
+          heldBytes,
+        });
+      }
     }
     this.checkpoint(this.tailState.offset);
     if (this.tailState.readOffset < size) this.readPending = true;
@@ -541,11 +610,16 @@ export class TranscriptWatcher {
   private startingTailers = new Set<string>();
   /** Set by stop(): a tailer still awaiting its start offset then never starts. */
   private stopped = false;
+  /** Re-reads already-tailed files when fs.watch misses an append (TAILED_APPEND_POLL_MS). */
+  private appendPollTimer: ReturnType<typeof setInterval> | null = null;
+  /** True while a poll tick is still awaiting stats; the next tick is skipped, never stacked. */
+  private appendPollInFlight = false;
 
   constructor(
     private config: TranscriptWatchConfig,
     private statePath: string,
-    observationTransport: TranscriptObservationTransport = 'in-process'
+    observationTransport: TranscriptObservationTransport = 'in-process',
+    private appendPollIntervalMs = TAILED_APPEND_POLL_MS,
   ) {
     this.processor = new TranscriptEventProcessor(observationTransport);
     this.state = loadWatchState(statePath);
@@ -562,6 +636,7 @@ export class TranscriptWatcher {
     for (const file of Object.keys(this.state.pendingTools ?? {})) {
       if (!this.tailers.has(file)) this.scheduleRetirementCheck(file);
     }
+    this.startAppendPoll();
   }
 
   stop(): void {
@@ -579,6 +654,38 @@ export class TranscriptWatcher {
     if (this.retirementTimer) clearTimeout(this.retirementTimer);
     this.retirementTimer = null;
     this.retirementCandidates.clear();
+    if (this.appendPollTimer) clearInterval(this.appendPollTimer);
+    this.appendPollTimer = null;
+  }
+
+  private startAppendPoll(): void {
+    if (this.appendPollTimer !== null || this.appendPollIntervalMs <= 0) return;
+    this.appendPollTimer = setInterval(() => {
+      void this.pollTailedAppends();
+    }, this.appendPollIntervalMs);
+    this.appendPollTimer.unref?.();
+  }
+
+  /**
+   * Already-tailed files only. Stats are awaited one at a time, so a user with
+   * thousands of historical rollouts never blocks hook or HTTP handling on a
+   * synchronous stat loop, and the poll holds at most one stat in flight. A
+   * tick still running when the next one fires makes that one a no-op. stop()
+   * ends the tick at the next file, and a tailer removed meanwhile is skipped.
+   */
+  private async pollTailedAppends(): Promise<void> {
+    if (this.stopped || this.appendPollInFlight) return;
+    this.appendPollInFlight = true;
+    try {
+      for (const [file, tailer] of [...this.tailers]) {
+        if (this.stopped) return;
+        const unread = await tailer.hasBytesPastReadOffset();
+        if (this.stopped) return;
+        if (unread && this.tailers.get(file) === tailer) tailer.poke();
+      }
+    } finally {
+      this.appendPollInFlight = false;
+    }
   }
 
   private async setupWatch(watch: WatchTarget): Promise<void> {

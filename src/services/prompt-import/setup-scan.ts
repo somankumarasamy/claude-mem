@@ -38,6 +38,11 @@ export interface SetupScanAgent {
   canRunSetup: boolean | null;
   /** Why it cannot, in the detection's words (e.g. "Gemini is installed, but this Google account can't use it: ..."). */
   cannotRunReason: string | null;
+  /**
+   * The JSON bytes this tool's prompts add to the hosted upload. The sum over the selected tools is never more than
+   * the upload's size, so a sum over INTENT_MAX_UPLOAD_BYTES means the upload cannot fit.
+   */
+  uploadBytes: number;
 }
 
 export interface SetupScanState {
@@ -61,7 +66,7 @@ export interface SetupScanState {
   usage: SetupTokenUsage | null;
   /** Why the token totals could not be read; the prompt scan itself still finished. */
   usageError: string | null;
-  /** Set when hosted extraction was unavailable (budget/rate limit) and setup finished locally without it. */
+  /** Set when hosted extraction did not run (budget/rate limit, or the history exceeds the hosted upload cap) and setup finished locally without it. */
   hostedNotice: string | null;
   /** The owner's newest typed prompts, newest first, quoted as typed (the Reveal shows them while no agent can extract). */
   recentPrompts: SetupRecentPrompt[];
@@ -101,7 +106,7 @@ export interface SetupScanOptions {
 }
 
 /** The agent runner's ids as the scan names those agents. */
-const RUNNER_AGENT_IDS: Record<UsableAgentId, PromptAgentId> = { 'claude-code': 'claude-code', codex: 'codex', gemini: 'gemini-cli' };
+const RUNNER_AGENT_IDS: Record<UsableAgentId, PromptAgentId> = { 'claude-code': 'claude-code', codex: 'codex', gemini: 'gemini-cli', opencode: 'opencode' };
 
 const AGENT_LABELS: Array<[PromptAgentId, string]> = [
   ['claude-code', 'Claude Code'], ['codex', 'Codex'], ['gemini-cli', 'Gemini CLI'], ['antigravity-cli', 'Antigravity CLI'], ['opencode', 'OpenCode'],
@@ -117,7 +122,7 @@ function idleState(): SetupScanState {
     // This preference does not start an upload; discovery still requires the person's confirmation.
     improveProduct: true,
     uploadedAgents: null,
-    agents: AGENT_LABELS.map(([id, label]) => ({ id, label, detected: false, prompts: 0, fromMemory: 0, fromTranscripts: 0, canRunSetup: null, cannotRunReason: null })),
+    agents: AGENT_LABELS.map(([id, label]) => ({ id, label, detected: false, prompts: 0, fromMemory: 0, fromTranscripts: 0, canRunSetup: null, cannotRunReason: null, uploadBytes: 0 })),
     percent: 0, phase: 'idle', done: false, windowStart: null, startedAt: null, finishedAt: null, durationMs: null,
     added: 0, skippedSources: 0, error: null, usage: null, usageError: null, hostedNotice: null, recentPrompts: [],
   };
@@ -126,6 +131,7 @@ function idleState(): SetupScanState {
 export class SetupScan {
   private current: SetupScanState = idleState();
   private running: Promise<void> | null = null;
+  private localExtraction: (() => Promise<boolean>) | null = null;
   private pendingUpload: { ownerPrompts: OwnerPrompt[]; summary: Partial<SetupScanState>; startedAt: number } | null = null;
   private listeners = new Set<(state: SetupScanState) => void>();
   private lastNotified = 0;
@@ -145,7 +151,12 @@ export class SetupScan {
     return () => this.listeners.delete(listener);
   }
 
-  /** Setup has one extraction path, supplied by the worker's hosted service. */
+  /** Returns false when the configured inference is unavailable. Only the consent route may then send prompts. */
+  setLocalExtractor(extract: () => Promise<boolean>): void {
+    this.localExtraction = extract;
+  }
+
+  /** Hosted setup runs for the prompts the owner explicitly selects. */
   setExtractor(extract: (prompts: OwnerPrompt[], improveProduct: boolean) => Promise<void>): void {
     this.extract = extract;
   }
@@ -246,15 +257,20 @@ export class SetupScan {
       await this.extract!(selected, this.current.improveProduct);
       this.finish(pending.summary, pending.startedAt);
     } catch (error) {
-      if ((error as { code?: string } | null)?.code === 'hosted-unavailable') {
-        // Preserve setup progress if automatic organization cannot run right now.
+      const code = (error as { code?: string } | null)?.code;
+      if (code === 'hosted-unavailable' || code === 'hosted-too-large') {
+        // Preserve setup progress if automatic organization cannot run right now, or can never take a
+        // history over the upload cap: retrying that scan would fail the same way, so finish locally.
         logger.warn('IMPORT', 'Hosted setup unavailable; continuing locally', { reason: (error as Error).message });
         try {
           await this.extract!([], this.current.improveProduct);
           // A refusal of the upload itself arrives after the request was sent; a preflight or cooldown refusal sent nothing.
           const sent = (error as { sent?: boolean }).sent !== false;
           if (!sent) this.current = { ...this.current, uploadedAgents: [] };
-          this.finish({ ...pending.summary, hostedNotice: 'Automatic organization is temporarily unavailable. You can continue setting up Claude-Mem.' }, pending.startedAt);
+          const hostedNotice = code === 'hosted-too-large'
+            ? 'Your recent work is larger than the hosted setup limit, so automatic organization did not run. You can continue setting up Claude-Mem.'
+            : 'Automatic organization is temporarily unavailable. You can continue setting up Claude-Mem.';
+          this.finish({ ...pending.summary, hostedNotice }, pending.startedAt);
           return this.state();
         } catch { /* fall through to the failure below */ }
       }
@@ -347,13 +363,23 @@ export class SetupScan {
           at: prompt.createdAtEpoch, cwd: prompt.cwd ?? null, text, project: prompt.project ?? '' }];
       });
       const ownerPrompts = [...result.ownerPrompts.filter(prompt => !deletedPrompts.has(prompt)), ...memoryOnly];
+      const uploadBytes = new Map<PromptAgentId, number>();
+      // One byte more per prompt for the comma that joins it to the next one in the upload's array.
+      for (const prompt of ownerPrompts) uploadBytes.set(prompt.agent, (uploadBytes.get(prompt.agent) ?? 0) + Buffer.byteLength(JSON.stringify(prompt)) + 1);
       const notTyped = memoryPrompts.filter(prompt => !result.ownerMemoryPromptIds.has(prompt.id)
         || (!claimedHookRowIds.has(prompt.id) && completeTranscript(sessionsByPlatform.get(prompt.platformSource), prompt.contentSessionId)));
       this.options.saveAgentWrittenPromptIds?.(notTyped.map(prompt => prompt.id));
       const { usage, usageError } = await this.tokenSavings(store, tokenUsage);
       const recentPrompts = [...ownerPrompts].sort((left, right) => right.at - left.at).slice(0, RECENT_PROMPTS)
         .map(prompt => ({ agent: prompt.agent, at: new Date(prompt.at).toISOString(), text: prompt.text.trim().slice(0, RECENT_PROMPT_CHARACTERS) }));
-      const summary = { agents, added, skippedSources: result.skippedSources.length, usage, usageError, recentPrompts };
+      const summary = { agents: agents.map(agent => ({ ...agent, uploadBytes: uploadBytes.get(agent.id) ?? 0 })), added, skippedSources: result.skippedSources.length, usage, usageError, recentPrompts };
+      if (ownerPrompts.length && this.localExtraction) {
+        this.update({ phase: 'organizing', percent: 98, ...summary }, true);
+        if (await this.localExtraction()) {
+          this.finish(summary, startedAt);
+          return;
+        }
+      }
       if (this.extract && !ownerPrompts.length) {
         // Nothing to upload, so there is nothing to ask about; the extractor records an empty result without contacting Cloud.
         this.update({ phase: 'uploading', percent: 99, ...summary }, true);

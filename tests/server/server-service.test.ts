@@ -1,6 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from 'bun:test';
 import pg from 'pg';
 import { ServerService } from '../../src/server/runtime/ServerService.js';
+import { ActiveServerQueueManager } from '../../src/server/runtime/ActiveServerQueueManager.js';
+import type { ServerJobQueue } from '../../src/server/jobs/ServerJobQueue.js';
+import type { ServerGenerationJobKind, ServerGenerationJobPayload } from '../../src/server/jobs/types.js';
 import {
   DisabledServerGenerationWorkerManager,
   DisabledServerQueueManager,
@@ -87,13 +90,156 @@ describe('ServerService', () => {
 
     const health = await fetch(`http://127.0.0.1:${address.port}/api/health`);
     expect(health.status).toBe(200);
-    expect((await health.json()).runtime).toBe('server-beta');
+    const healthBody = await health.json();
+    expect(healthBody.runtime).toBe('server-beta');
+    // /api/health is unauthenticated over the container network, so it publishes
+    // the same probe state /v1/info does — never the auth mode or the install path.
+    expect(healthBody.ai.authMethod).toBeUndefined();
+    expect(healthBody.workerPath).toBeUndefined();
 
     const info = await fetch(`http://127.0.0.1:${address.port}/v1/info`);
     expect(info.status).toBe(200);
     const body = await info.json();
     expect(body.runtime).toBe('server-beta');
     expect(body.boundaries.queueManager.status).toBe('disabled');
+    // The route is unauthenticated and reachable over the container network,
+    // so it publishes state a probe reads and not the deployment's internals.
+    expect(body.authMode).toBeUndefined();
+    expect(body.postgres.schemaVersion).toBeUndefined();
+    expect(typeof body.postgres.initialized).toBe('boolean');
+    expect(Object.keys(body.boundaries.queueManager)).toEqual(['status']);
+    expect(Object.keys(body.boundaries.generationWorkerManager)).toEqual(['status']);
+    // vectorSearch keeps the shape docs/public/hosted-server.mdx documents.
+    expect(typeof body.vectorSearch.available).toBe('boolean');
+    expect(typeof body.vectorSearch.model).toBe('string');
+    expect(body.vectorSearch).toHaveProperty('observationsWithoutVectors');
+    expect(body.vectorSearch).toHaveProperty('lastEmbedError');
+    expect(body.vectorSearch.error).toBeUndefined();
+  });
+
+  it('logs why /v1/info could not read vector search, while the response leaves the error out', async () => {
+    service = new ServerService({
+      graph: createStubGraph(),
+      port: 0,
+      host: '127.0.0.1',
+      persistRuntimeState: false,
+    });
+    await service.start();
+    const address = service.getRuntimeState();
+
+    // The stub pool refuses every query, so the vector search probe fails.
+    const info = await fetch(`http://127.0.0.1:${address.port}/v1/info`);
+    expect(info.status).toBe(200);
+    const body = await info.json();
+    expect(body.vectorSearch.available).toBe(false);
+    expect(JSON.stringify(body)).not.toContain('stub pool');
+    const vectorWarnings = (logger.warn as unknown as ReturnType<typeof spyOn>).mock.calls
+      .filter(call => call[1] === 'Vector search status could not be read for /v1/info');
+    expect(vectorWarnings).toHaveLength(1);
+    expect(vectorWarnings[0][0]).toBe('SYSTEM');
+    expect((vectorWarnings[0][3] as Error).message).toContain('stub pool: query not supported in this test');
+  });
+
+  it('leaves the raw lane failure reason out of the unauthenticated /v1/info lanes', async () => {
+    // Production reports lane metrics through a real ActiveServerQueueManager.
+    // When a lane's counts cannot be read (a Redis blip), the lane surfaces
+    // `unavailable` — and the driver's raw error text with it, which the
+    // /v1/info route's own comment calls reconnaissance for anyone who can
+    // reach the port. /api/health already strips that field (#6309); the
+    // unauthenticated /v1/info must not ship it either.
+    const failingCounts = 'connect ECONNREFUSED 10.9.8.7:6379';
+    const makeQueue = (name: string, failCounts: boolean) => ({
+      name,
+      add: async () => {},
+      remove: async () => {},
+      getJob: async () => null,
+      getCounts: failCounts
+        ? async () => { throw new Error(failingCounts); }
+        : async () => ({ waiting: 0, active: 0, delayed: 0, failed: 0, completed: 0 }),
+      getLifecycleCounters: () => ({ stalled: 0 }),
+      start: () => {},
+      isStarted: () => false,
+      close: async () => {},
+    }) as unknown as ServerJobQueue<ServerGenerationJobPayload>;
+    const queues = new Map<ServerGenerationJobKind, ServerJobQueue<ServerGenerationJobPayload>>([
+      ['event', makeQueue('test-event', true)],
+      ['summary', makeQueue('test-summary', false)],
+    ]);
+    const manager = new ActiveServerQueueManager({
+      engine: 'bullmq',
+      mode: 'managed',
+      url: null,
+      host: '127.0.0.1',
+      port: 6379,
+      prefix: 'cmem-test',
+      connection: { host: '127.0.0.1', port: 6379, lazyConnect: true },
+    }, queues);
+    service = new ServerService({
+      graph: { ...createStubGraph(), queueManager: manager },
+      port: 0,
+      host: '127.0.0.1',
+      persistRuntimeState: false,
+    });
+    await service.start();
+    const address = service.getRuntimeState();
+
+    const info = await fetch(`http://127.0.0.1:${address.port}/v1/info`);
+    expect(info.status).toBe(200);
+    const body = await info.json();
+    expect(body.boundaries.queueManager.status).toBe('active');
+    expect(body.queueLanes).toHaveLength(2);
+    const failedLane = body.queueLanes.find((lane: { kind: string }) => lane.kind === 'event');
+    expect(failedLane.unavailable).toBe(true);
+    // The counts stay publishable; the reason text does not.
+    expect(failedLane.unavailableReason).toBeUndefined();
+    expect(JSON.stringify(body)).not.toContain('ECONNREFUSED');
+  });
+
+  it('keeps the lane failure reason on the loopback-only doctor route', async () => {
+    // /api/admin/doctor is loopback-only and `claude-mem doctor` reads the
+    // recorded failure message for its remediation row, so the strip that
+    // protects the unauthenticated /v1/info must not reach this route.
+    const failingCounts = 'connect ECONNREFUSED 10.9.8.7:6379';
+    const makeQueue = (name: string, failCounts: boolean) => ({
+      name,
+      add: async () => {},
+      remove: async () => {},
+      getJob: async () => null,
+      getCounts: failCounts
+        ? async () => { throw new Error(failingCounts); }
+        : async () => ({ waiting: 0, active: 0, delayed: 0, failed: 0, completed: 0 }),
+      getLifecycleCounters: () => ({ stalled: 0 }),
+      start: () => {},
+      isStarted: () => false,
+      close: async () => {},
+    }) as unknown as ServerJobQueue<ServerGenerationJobPayload>;
+    const queues = new Map<ServerGenerationJobKind, ServerJobQueue<ServerGenerationJobPayload>>([
+      ['event', makeQueue('test-event', true)],
+      ['summary', makeQueue('test-summary', false)],
+    ]);
+    const manager = new ActiveServerQueueManager({
+      engine: 'bullmq',
+      mode: 'managed',
+      url: null,
+      host: '127.0.0.1',
+      port: 6379,
+      prefix: 'cmem-test',
+      connection: { host: '127.0.0.1', port: 6379, lazyConnect: true },
+    }, queues);
+    service = new ServerService({
+      graph: { ...createStubGraph(), queueManager: manager },
+      port: 0,
+      host: '127.0.0.1',
+      persistRuntimeState: false,
+    });
+    await service.start();
+    const address = service.getRuntimeState();
+
+    const doctor = await (await fetch(`http://127.0.0.1:${address.port}/api/admin/doctor`)).json();
+    const lanes = doctor.health.queue.lanes as Array<{ kind: string; unavailable?: boolean; unavailableReason?: string }>;
+    const failedLane = lanes.find(lane => lane.kind === 'event');
+    expect(failedLane.unavailable).toBe(true);
+    expect(failedLane.unavailableReason).toBe('connect ECONNREFUSED 10.9.8.7:6379');
   });
 
   // Phase 4 integration test: Postgres-backed v1 events route must enforce

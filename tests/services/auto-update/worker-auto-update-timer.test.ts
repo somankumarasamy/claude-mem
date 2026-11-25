@@ -354,7 +354,6 @@ describe('WorkerService.start', () => {
     const bootSteps: string[] = [];
     const listen = mock(async () => { bootSteps.push('listen'); });
     Object.assign(workerFixture.worker, {
-      tvToken: '',
       server: { ...workerFixture.worker.server, listen, getLastResponseFinishedAt: () => 0 },
       detectPreviousShutdown: () => {},
       initializeBackground: mock(() => { bootSteps.push('initializeBackground'); return initializeBackground(); }),
@@ -583,11 +582,15 @@ describe('WorkerService.buildAutoUpdateCheckDeps', () => {
     try {
       workerFixture.worker.workViewRoutes = routes;
       const deps: AutoUpdateCheckDeps = workerFixture.worker.buildAutoUpdateCheckDeps(new Set());
-      expect(routes.backgroundWorkRunning({ countScanWaitingForUploadAnswer: false })).toEqual(['extraction']);
+      expect(routes.backgroundWorkRunning({ countScanWaitingForUploadAnswer: false, failOnUnreadableRefresh: true })).toEqual(['extraction']);
       expect(deps.isWorkerQuiet()).toBe(false);
       // Finished, or left 'running' by a worker that is gone.
       refreshStatus = { state: 'ok', pid: process.pid };
       expect(deps.isWorkerQuiet()).toBe(true);
+      // A refresh.json that cannot be read: the run is unknown, so the updater counts it as busy.
+      (routes as unknown as { autoRefresh: unknown }).autoRefresh = { status: () => { throw new SyntaxError('JSON Parse error: Unrecognized token'); }, close() {} };
+      expect(() => workerFixture.worker.runningBackgroundJobNames()).toThrow('JSON Parse error');
+      expect(() => deps.isWorkerQuiet()).toThrow('JSON Parse error');
     } finally {
       routes.close();
     }

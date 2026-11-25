@@ -4,14 +4,15 @@ import path from 'path';
 import { readFileSync, existsSync } from 'fs';
 import { logger } from '../../../../utils/logger.js';
 import { getPackageRoot } from '../../../../shared/paths.js';
+import type { ViewerSyncStatus } from '../../../../shared/viewer-sync-status.js';
 import { SSEBroadcaster } from '../../SSEBroadcaster.js';
 import { DatabaseManager } from '../../DatabaseManager.js';
 import { SessionManager } from '../../SessionManager.js';
 import { BaseRouteHandler } from '../BaseRouteHandler.js';
 
 // Read on first request, not at import. Hook processes share this module but
-// never serve the viewer or Observation TV, so reading at import made every
-// hook spawn read both HTML files and log a boot line for nothing (#3665).
+// never serve the viewer, so reading at import made every
+// hook spawn read the HTML files and log a boot line for nothing (#3665).
 //
 // Only a successful read is cached. A miss checks the disk again on the next
 // request, so a worker that outlives its plugin folder (an update that swaps
@@ -47,7 +48,6 @@ export function lazyUiHtml(
 
 const getViewerHtmlBytes = lazyUiHtml('viewer.html');
 const getWorkViewHtmlBytes = lazyUiHtml('work-view/index.html');
-const getTvHtmlBytes = lazyUiHtml('tv.html');
 
 /**
  * Served with a 503 when a UI file is missing from the install. This is an
@@ -216,7 +216,8 @@ export class ViewerRoutes extends BaseRouteHandler {
   constructor(
     private sseBroadcaster: SSEBroadcaster,
     private dbManager: DatabaseManager,
-    private sessionManager: SessionManager
+    private sessionManager: SessionManager,
+    private getSyncStatus?: () => ViewerSyncStatus
   ) {
     super();
   }
@@ -234,7 +235,6 @@ export class ViewerRoutes extends BaseRouteHandler {
     app.get('/health', this.handleHealth.bind(this));
     app.get('/', this.handleWorkViewUI.bind(this));
     app.get('/viewer', this.handleViewerUI.bind(this));
-    app.get('/tv', this.handleTvUI.bind(this));
     app.get('/restart', this.handleRestartPage.bind(this));
     app.get('/stream', this.handleSSEStream.bind(this));
   }
@@ -282,21 +282,6 @@ export class ViewerRoutes extends BaseRouteHandler {
   });
 
   /**
-   * Observation TV: the same /stream the viewer consumes, rendered as a
-   * full-screen fading title card. Static, dependency-free, and served from
-   * the same origin so the EventSource needs no CORS of its own.
-   */
-  private handleTvUI = this.wrapHandler((req: Request, res: Response): void => {
-    const tvHtmlBytes = getTvHtmlBytes();
-    if (!tvHtmlBytes) {
-      sendUiMissingPage(res, 'Observation TV');
-      return;
-    }
-    res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    res.send(tvHtmlBytes);
-  });
-
-  /**
    * The target of the restart link in the observer-outage warning
    * (renderObserverHealthWarning). Serves an INERT page: the restart itself is
    * the POST /api/admin/restart behind the button, never this GET.
@@ -337,8 +322,18 @@ export class ViewerRoutes extends BaseRouteHandler {
     this.sseBroadcaster.addClient(res);
 
     const projectCatalog = this.dbManager.getSessionStore().getProjectCatalog();
+    // Live sync events report changes. A joining tab also needs the current state.
+    let sync: ViewerSyncStatus | undefined;
+    try {
+      sync = this.getSyncStatus?.();
+    } catch (error) {
+      logger.warn('HTTP', 'Failed to read initial viewer sync status', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
     this.sseBroadcaster.sendToClient(res, {
       type: 'initial_load',
+      sync,
       projects: projectCatalog.projects,
       sources: projectCatalog.sources,
       projectsBySource: projectCatalog.projectsBySource,

@@ -9,9 +9,10 @@ import { agentStopFor, readAgentStops } from './agent-lifecycle.mjs';
 import { withDerivedProjects } from './session-project.mjs';
 import { observationMediaFromMetadata } from '../media/feed.js';
 import { appliedLabel, workStateItems } from './work-state-labels.mjs';
+import { GROK_BUILD_PLATFORM_SOURCE } from '../../shared/platform-source.js';
 const PROJECT_KEY = (value) => String(value ?? '').replace(/[A-Z]/g, (c) => c.toLowerCase());
 // Live Gemini CLI hooks record `gemini`; the Gemini CLI importer records `gemini-cli`. Both are one host.
-const PLATFORMS = { codex: 'Codex', claude: 'Claude Code', gemini: 'Gemini CLI', 'gemini-cli': 'Gemini CLI', 'antigravity-cli': 'Antigravity CLI', kimi: 'Kimi', 'hermes-cli': 'Hermes', 'pi-agent': 'Pi' };
+const PLATFORMS = { codex: 'Codex', claude: 'Claude Code', gemini: 'Gemini CLI', 'gemini-cli': 'Gemini CLI', 'antigravity-cli': 'Antigravity CLI', [GROK_BUILD_PLATFORM_SOURCE]: 'Grok Build', kimi: 'Kimi', 'hermes-cli': 'Hermes', 'pi-agent': 'Pi' };
 export const platformLabel = (platform) => PLATFORMS[platform] ?? compactText(platform, 48) ?? 'Unassigned';
 const stamp = (value) => Number.isFinite(Number(value)) && Number(value) > 0 ? new Date(Number(value)).toISOString() : null;
 const fingerprint = (value) => JSON.stringify(Object.entries(value).sort(([a], [b]) => a.localeCompare(b)));
@@ -179,7 +180,9 @@ function launchRequest(launch) {
   return text ? { text, source: 'agent-launch', sourceId: launch.shared ? null : launch.toolUseId, url: launch.shared ? null : `/api/work-view/evidence/tool-use/${launch.toolUseId}` } : null;
 }
 
-export function buildAgentView(state, records, { now = Date.now(), workLimit = 240, activityLimit = 160, recentMs = 15 * 60 * 1000, titleCache = {}, ledger = null, onProductFile = null, workStateLabels = null } = {}) {
+export const DEFAULT_RECENT_ACTIVITY_MS = 15 * 60 * 1000;
+
+export function buildAgentView(state, records, { now = Date.now(), workLimit = 240, activityLimit = 160, recentMs = DEFAULT_RECENT_ACTIVITY_MS, titleCache = {}, ledger = null, onProductFile = null, workStateLabels = null, localFiles = true, getProjectRoot } = {}) {
   const { calls = [], observations = [], summaries = [], sessions = [], prompts = [], agentLaunches = [], agentToolActivity = [] } = records;
   const launches = readAgentLaunches(agentLaunches);
   const lastToolEpochs = new Map(agentToolActivity.map((row) => [lifecycleKey(row.platform_source, row.content_session_id, row.agent_id), Number(row.last_epoch) || 0]));
@@ -296,7 +299,8 @@ export function buildAgentView(state, records, { now = Date.now(), workLimit = 2
     const original = prompt ? { source: 'user-prompt', sourceId: prompt.id, url: `/api/work-view/evidence/prompt/${prompt.id}` } : null;
     if (summary && readableRequest(summary.request)) return { key, text: readableRequest(summary.request), source: 'session-summary-request', sourceId: summary.id, url: `/api/work-view/evidence/summary/${summary.id}`, original };
     if (prompt && readableRequest(prompt.prompt_text)) return { key, text: readableRequest(prompt.prompt_text), ...original };
-    if ((number == null || number <= 1) && readableRequest(session.user_prompt)) return { key, text: readableRequest(session.user_prompt), source: 'session-initial-request', sourceId: session.sharedOnly ? null : session.id, url: session.sharedOnly ? null : `/api/work-view/evidence/session/${session.id}` };
+    const opening = readableRequest(Object.hasOwn(session, 'sharedOpeningPrompt') ? session.sharedOpeningPrompt : session.user_prompt);
+    if ((number == null || number <= 1) && opening) return { key, text: opening, source: 'session-initial-request', sourceId: session.sharedOnly ? null : session.id, url: session.sharedOnly ? null : `/api/work-view/evidence/session/${session.id}` };
     return null;
   }
 
@@ -451,7 +455,7 @@ export function buildAgentView(state, records, { now = Date.now(), workLimit = 2
     };
   }).sort((a, b) => String(b.presence.lastActivityAt ?? '').localeCompare(String(a.presence.lastActivityAt ?? '')));
   const recentActivity = activity.sort((a, b) => b.atEpoch - a.atEpoch).slice(0, activityLimit);
-  const requestProjection = buildHumanRequests({ agents, recentActivity }, records, { titleCache, ledger, onProductFile });
+  const requestProjection = buildHumanRequests({ agents, recentActivity }, records, { titleCache, ledger, onProductFile, localFiles, getProjectRoot });
   const { focusAreas, focusAreaIdByAnchor } = buildFocusAreas(state);
   return {
     version: 1, generatedAt: stamp(now), currentProject: state.currentProject, currentProjectScope: state.currentProjectScope,
@@ -534,6 +538,7 @@ export function buildOwnerGoalHistory(state) {
 
 export function readEvidence(database, kind, id) {
   if (!Number.isSafeInteger(id) || id < 1) return null;
+  if (database.readEvidence) return database.readEvidence(kind, id);
   const queries = {
     'work-state': 'SELECT id, project, list_name, fields, created_at_epoch FROM work_state_entries WHERE id = ?',
     observation: 'SELECT id, project, title, subtitle, narrative, created_at_epoch FROM observations WHERE id = ?',

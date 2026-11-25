@@ -36,6 +36,7 @@ import {
   readContextCache,
   contextCacheVariantId,
   listContextCacheFiles,
+  refreshContextProjectCatalog,
   removeContextCache,
   writeContextCache,
   type ContextCacheKeys,
@@ -43,6 +44,7 @@ import {
 import { writeJsonFileAtomic } from '../../shared/atomic-json.js';
 import { onContextInvalidation, type ContextInvalidation } from '../../shared/context-invalidation.js';
 import { isSessionStartWorkStateList } from '../context/sections/WorkStateRenderer.js';
+import { ContextReadTimeoutError } from '../context/ContextReadWorkerClient.js';
 import { logger } from '../../utils/logger.js';
 
 export const CONTEXT_CACHE_RENDER_DEBOUNCE_MS = 2_000;
@@ -71,6 +73,8 @@ export interface ContextCacheServiceOptions {
   renderVariant: (keys: ContextCacheKeys) => Promise<ContextVariantRender>;
   /** Every stored key a read of `projects` matches (projectReadKeys). */
   expandProjectReadKeys: (projects: string[]) => string[] | Promise<string[]>;
+  /** Every project in the local catalog, to keep the hook's stored list current (refreshContextProjectCatalog). */
+  listCatalogProjects?: () => string[];
   debounceMs?: number;
   maxVariants?: number;
   /** False keeps the files unservable until setServable(true). Default true. */
@@ -288,6 +292,7 @@ export class ContextCacheService {
 
   private handleInvalidation(invalidation: ContextInvalidation): void {
     this.invalidationGeneration++;
+    this.refreshStoredProjectCatalog(invalidation);
     const removal = invalidation.kind === 'removal';
     // A work-state write is additive, but the open lists are what the next
     // session acts on: a block served before its re-render would hand a fresh
@@ -315,6 +320,22 @@ export class ContextCacheService {
     if (matched === 0) return;
     logger.debug('CONTEXT_CACHE', 'Context invalidated', { reason: invalidation.reason, kind: invalidation.kind, variants: matched });
     this.scheduleRender();
+  }
+
+  /**
+   * A cache-first SessionStart names its all-project variant from the stored
+   * catalog, so a new project must reach that list on the write that adds it.
+   * This runs inside the writer's emit: a failure is logged, never thrown.
+   */
+  private refreshStoredProjectCatalog(invalidation: ContextInvalidation): void {
+    const listCatalogProjects = this.options.listCatalogProjects;
+    if (!listCatalogProjects) return;
+    try {
+      refreshContextProjectCatalog(invalidation.scope === 'all' ? 'all' : invalidation.scope.projects, listCatalogProjects);
+    } catch (error) {
+      logger.warn('CONTEXT_CACHE', 'Could not refresh the stored SessionStart project catalog', { reason: invalidation.reason },
+        error instanceof Error ? error : new Error(String(error)));
+    }
   }
 
   private requeueAfterRemoval(variantId: string): void {
@@ -376,8 +397,14 @@ export class ContextCacheService {
         this.persistRender(variant, variant.keys, { ...render, readKeys: render.readKeys ?? readKeys }, renderedAtEpochMs, renderSequenceAtStart);
       } catch (error) {
         // The old file would now be wrong; remove it so the hook takes the live path.
-        logger.error('CONTEXT_CACHE', 'Context re-render failed; removing the cached block', { variantId, keys: variant.keys },
-          error instanceof Error ? error : new Error(String(error)));
+        const failure = error instanceof Error ? error : new Error(String(error));
+        if (failure instanceof ContextReadTimeoutError) {
+          const { method, queuedMs, runningMs } = failure;
+          logger.warn('CONTEXT_CACHE', 'Context re-render failed: a context read ran past the deadline; removing the cached block',
+            { variantId, keys: variant.keys, method, queuedMs, runningMs }, failure);
+        } else {
+          logger.error('CONTEXT_CACHE', 'Context re-render failed; removing the cached block', { variantId, keys: variant.keys }, failure);
+        }
         // A newer render may already have written a good file; the failed one
         // removes it only when nothing that started later reached the file.
         if (this.variants.get(variantId) === variant && this.claimRenderSequence(variant, renderSequenceAtStart)) {

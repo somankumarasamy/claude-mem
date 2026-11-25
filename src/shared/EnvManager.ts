@@ -3,7 +3,7 @@ import { createHash } from 'crypto';
 import { existsSync, readFileSync, writeFileSync, mkdirSync, chmodSync } from 'fs';
 import { parseEnv } from 'util';
 import { basename, join } from 'path';
-import { ENV_PROXY_VARS } from '../supervisor/env-sanitizer.js';
+import { ENV_PROXY_VARS, sanitizeEnv } from '../supervisor/env-sanitizer.js';
 import { logger } from '../utils/logger.js';
 import { paths } from './paths.js';
 import { readJsonFileWithBom, stripUtf8Bom } from './atomic-json.js';
@@ -390,6 +390,21 @@ export function buildIsolatedEnv(includeCredentials: boolean = true): Record<str
   return isolatedEnv;
 }
 
+/** Credentials for both the OpenCode login probe and its headless run. */
+export function buildOpenCodeEnv(): NodeJS.ProcessEnv {
+  const env = sanitizeEnv(buildIsolatedEnv());
+  const anthropic = ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL'] as const;
+  // Keep an explicitly configured gateway and its credentials together. Otherwise
+  // OpenCode can use its shell login, including the endpoint that goes with it.
+  if (!anthropic.some(key => env[key]) && (process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN)) {
+    for (const key of anthropic) {
+      const value = process.env[key];
+      if (value) env[key] = value;
+    }
+  }
+  return env;
+}
+
 /**
  * Async variant of buildIsolatedEnv() that reads the OAuth token from the
  * platform-native credential store at the moment of spawn. Use this at SDK
@@ -400,7 +415,10 @@ export function buildIsolatedEnv(includeCredentials: boolean = true): Record<str
  *   - expired: do NOT inject. Log re-login message. Write stale marker so
  *     the session-start hook can surface the message to the user.
  *   - absent: proceed without the token. Worker may fall back to
- *     ANTHROPIC_API_KEY or other auth.
+ *     ANTHROPIC_API_KEY or other auth. Without one, log a WARN and pass the
+ *     reason to onUnusableLogin for the session notice (#6319).
+ *   - expired because the CLI ended the login (no refresh token left): the
+ *     stale marker as for expired, then the absent handling (#6319).
  *
  * Issue #2215: this replaces the old "copy CLAUDE_CODE_OAUTH_TOKEN from
  * process.env" path which silently injected stale tokens.
@@ -414,7 +432,19 @@ export async function buildIsolatedEnvWithFreshOAuth(
    * Either keeps the primary credential when the other one is missing, and
    * both are ignored under ANTHROPIC_BASE_URL.
    */
-  { standIn }: { standIn?: ClaudeCredential } = {},
+  {
+    standIn,
+    onUnusableLogin,
+  }: {
+    standIn?: ClaudeCredential;
+    /**
+     * Called with the reason when this spawn leaves the child no login it can
+     * use and no explicit credential stands in (#6319): the store held none,
+     * the CLI had ended it, or the read failed. The caller keeps it on the
+     * run, so a "Not logged in" reply can be explained per session.
+     */
+    onUnusableLogin?: (reason: string) => void;
+  } = {},
 ): Promise<Record<string, string>> {
   const isolatedEnv = buildIsolatedEnv(includeCredentials);
 
@@ -501,12 +531,9 @@ export async function buildIsolatedEnvWithFreshOAuth(
   try {
     result = await readClaudeOAuthToken();
   } catch (error) {
-    logger.warn(
-      'OAUTH',
-      'OAuth token read failed unexpectedly; proceeding without token',
-      {},
-      error instanceof Error ? error : new Error(String(error)),
-    );
+    const err = error instanceof Error ? error : new Error(String(error));
+    logger.warn('OAUTH', 'OAuth token read failed unexpectedly; proceeding without token', {}, err);
+    if (!hasExplicitCredentials) onUnusableLogin?.(`the credential store read failed: ${err.message}`);
     return restoreExplicitCredentials('token read failed');
   }
 
@@ -528,7 +555,6 @@ export async function buildIsolatedEnvWithFreshOAuth(
       writeStaleMarker(result.reason);
       break;
     case 'absent':
-      logger.debug('OAUTH', `No OAuth token available: ${result.reason}`);
       // Token is absent — any prior stale-marker would have been written
       // when the token was expired, but is no longer accurate now that the
       // token is gone. Clear it so the session-start hook stops surfacing
@@ -538,8 +564,22 @@ export async function buildIsolatedEnvWithFreshOAuth(
       break;
   }
 
-  // Leave expired logins to the CLI's refresh flow without the spent key taking precedence.
-  if (result.kind === 'absent') return restoreExplicitCredentials('token absent');
+  // Leave lapsed logins to the CLI's refresh flow without the spent key taking
+  // precedence. A login the CLI ENDED has no refresh token left (#6319), so,
+  // like a missing one, it leaves the child nothing to run on.
+  if (result.kind === 'present' || (result.kind === 'expired' && result.loginEnded === undefined)) return isolatedEnv;
+  if (hasExplicitCredentials) return restoreExplicitCredentials(result.kind === 'absent' ? 'token absent' : 'login ended');
+  // #6319: this used to be a DEBUG line, so at INFO the log went quiet while
+  // every observer call answered "Not logged in". The `present` branch logs
+  // INFO on every spawn, so a WARN per spawn here is the same rate. An ended
+  // login already got its WARN above.
+  if (result.kind === 'absent') {
+    logger.warn(
+      'OAUTH',
+      `No Claude Code login could be read for the observer (${result.reason}); the observer will rely on the CLI finding its own login. If observations fail with "Not logged in", put a \`claude setup-token\` token in ~/.claude-mem/.env as CLAUDE_CODE_OAUTH_TOKEN.`,
+    );
+  }
+  onUnusableLogin?.(result.reason);
   return isolatedEnv;
 }
 

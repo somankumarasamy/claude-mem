@@ -98,6 +98,7 @@ describe('resolveOpenAICompatConfig', () => {
     ['iflytek', 'https://maas-api.cn-huabei-1.xf-yun.com/v2', 'spark-x2.5'],
     ['minimax', 'https://api.minimax.io/v1', 'MiniMax-M3'],
     ['minimax-cn', 'https://api.minimaxi.com/v1', 'MiniMax-M3'],
+    ['modelgo', 'https://api.modelgo.ai/v1', ''],
     ['obscurify-ai', 'https://obscurify.ai/v1', 'deepseek/deepseek-v4-flash'],
     ['opencode-go', 'https://opencode.ai/zen/go/v1', 'kimi-k3'],
     ['opencode-zen', 'https://opencode.ai/zen/v1', ''],
@@ -108,6 +109,8 @@ describe('resolveOpenAICompatConfig', () => {
     ['standardcompute', 'https://api.stdcmpt.com/v1', 'deepseek/deepseek-v4-flash'],
     ['trustedrouter', 'https://api.trustedrouter.com/v1', 'deepseek/deepseek-v4-flash'],
     ['uberllm', 'https://api.uberllm.dev/v1', 'deepseek/deepseek-v4.1-flash'],
+    ['worldrouter', 'https://inference-api.worldrouter.ai/v1', 'deepseek-v4-flash'],
+    ['aigrow', 'https://aigrow.gg/v1', 'claude-haiku-5.5'],
   ])('resolves %s with its hosted endpoint and default model', (id, baseUrl, defaultModel) => {
     process.env.CLAUDE_MEM_OPENAI_COMPAT_PRESET = id;
     process.env.CLAUDE_MEM_OPENAI_COMPAT_API_KEY = 'fixture-preset-key';

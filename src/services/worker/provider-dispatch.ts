@@ -26,6 +26,7 @@
  */
 
 import { SettingsDefaultsManager, type SettingsDefaults } from '../../shared/SettingsDefaultsManager.js';
+import { SELECTABLE_PROVIDERS, type SelectableProvider } from '../../ui/provider-options.js';
 import { readFileSync } from 'fs';
 import { parseJsonWithBom } from '../../shared/atomic-json.js';
 import { settingsTarget } from '../../shared/settings-document.js';
@@ -34,13 +35,15 @@ import { logger } from '../../utils/logger.js';
 import { normalizePlatformSource } from '../../shared/platform-source.js';
 import { PROVIDER_BY_SOURCE_SETTING, parseProviderBySource } from '../../shared/provider-by-source.js';
 import { isCmemGatewayUrl, setSessionProviderResolver, writeProFallbackAt, type ProFallbackNotice } from '../../shared/cmem-gateway.js';
-import { cmemCapProbeAllowed } from '../../shared/cmem-cap-probe.js';
+import { cmemCapProbeAllowed, cmemCapExhaustedAt } from '../../shared/cmem-cap-probe.js';
 import { scrubErrorMessage, type ObserverQuotaNoticeHold } from '../../shared/observer-health.js';
 import { hasAnthropicApiKey } from '../../shared/EnvManager.js';
 import { resolveOpenAICompatPreset } from '../../shared/openai-compat-presets.js';
 import { isGeminiAvailable, isGeminiSelected } from './GeminiProvider.js';
 import { isOpenRouterAvailable, isOpenRouterSelected, resolveOpenRouterConfig } from './OpenRouterProvider.js';
 import { isOpenAICompatAvailable, isOpenAICompatSelected } from './OpenAICompatProvider.js';
+import { hasCodexChatGptLogin } from './CodexAppServerClient.js';
+import { CODEX_CLI_SETUP_RECHECK_COOLDOWN_MS, getDependencyStatus, isDependencyStatusInCooldown } from '../../shared/dependency-health.js';
 import { isCodexSelected } from './CodexProvider.js';
 import { isClassified, type ClassifiedProviderError } from './provider-errors.js';
 import { canClaudeServeAsFallback, claudeQuotaStandIn } from '../../shared/claude-fallback-readiness.js';
@@ -65,7 +68,7 @@ import {
  * src/shared/openai-compat-presets.ts for why it is not folded into
  * openrouter.
  */
-export type SelectableProvider = 'claude' | 'gemini' | 'openrouter' | 'codex' | 'openai-compatible';
+export type { SelectableProvider } from '../../ui/provider-options.js';
 
 /** Retry a fallen-back gateway occasionally so a later subscription recovers. */
 export const CMEM_FALLBACK_RETRY_MS = 15 * 60_000;
@@ -87,7 +90,7 @@ export function shouldUseCmemFallback(
  * gate refuses every gateway run, so a probe admitted into it would run
  * nothing at all, neither on the gateway nor on Claude.
  */
-function staysOnClaudeInFallback(fallbackAt: string): boolean {
+function gatewayProbeWithheld(fallbackAt: string): boolean {
   return shouldUseCmemFallback(fallbackAt) || isQuotaCooldownActive('openrouter');
 }
 
@@ -107,14 +110,12 @@ export interface ProviderSelection {
    * selection by hand stay valid — read it loosely (`?? null`).
    */
   fallbackFrom?: SelectableProvider | null;
+  /** The gateway is capped and this machine has no authorized, available fallback. */
+  capBlocked?: boolean;
 }
 
 /** What CLAUDE_MEM_QUOTA_FALLBACK_PROVIDER may name. */
-export const QUOTA_FALLBACK_PROVIDERS = ['claude', 'gemini', 'openrouter', 'openai-compatible'] as const;
-export type QuotaFallbackProvider = typeof QUOTA_FALLBACK_PROVIDERS[number];
-
-/** The CLAUDE_MEM_QUOTA_FALLBACK_PROVIDER value that turns the fallback off. */
-export const QUOTA_FALLBACK_OFF = 'off';
+export type QuotaFallbackProvider = SelectableProvider;
 
 /**
  * The configured fallback, or null when it is turned off ('off') or the value
@@ -126,7 +127,7 @@ export function readQuotaFallbackProvider(): QuotaFallbackProvider | null {
   const settings = SettingsDefaultsManager.loadFromFile(paths.settings());
   const raw = String(settings.CLAUDE_MEM_QUOTA_FALLBACK_PROVIDER ?? '').trim();
   if (raw === '') return 'claude';
-  return (QUOTA_FALLBACK_PROVIDERS as readonly string[]).includes(raw) ? raw as QuotaFallbackProvider : null;
+  return (SELECTABLE_PROVIDERS as readonly string[]).includes(raw) ? raw as QuotaFallbackProvider : null;
 }
 
 /**
@@ -155,10 +156,16 @@ function gatewayFallbackState(): 'not-refusing' | 'refusing' | 'probe' {
  */
 function isFallbackAvailable(provider: QuotaFallbackProvider): boolean {
   switch (provider) {
+    case 'codex': {
+      const setup = getDependencyStatus('codex_cli');
+      return (!setup || !isDependencyStatusInCooldown(setup, CODEX_CLI_SETUP_RECHECK_COOLDOWN_MS))
+        && hasCodexChatGptLogin();
+    }
     case 'gemini': return isGeminiAvailable();
     case 'openai-compatible': return isOpenAICompatAvailable();
     case 'claude': return canClaudeServeAsFallback();
-    case 'openrouter': return isOpenRouterAvailable() && gatewayFallbackState() !== 'refusing';
+    case 'openrouter': return isOpenRouterAvailable() && gatewayFallbackState() !== 'refusing'
+      && (!isCmemGatewayUrl(resolveOpenRouterConfig().apiUrl) || cmemCapProbeAllowed());
   }
 }
 
@@ -345,19 +352,22 @@ export function resetQuotaFallbackStateForTesting(): void {
  * `selectProviderForGenerator` instead, or it becomes part of the herd.
  */
 export function getSelectedProvider(platformSource?: string): SelectableProvider {
-  return routedProviderFor(primaryFor(platformSource));
+  return routedProviderFor(primaryFor(platformSource), platformSource);
 }
 
 /** The read-only counterpart of `selectForPrimary`: where `primary`'s work goes right now. */
-function routedProviderFor(primary: SelectableProvider): SelectableProvider {
+function routedProviderFor(primary: SelectableProvider, platformSource?: string): SelectableProvider {
   if (primary === 'openrouter') {
     const settings = SettingsDefaultsManager.loadFromFile(paths.settings());
+    if (isCmemGatewayUrl(resolveOpenRouterConfig().apiUrl) && !cmemCapProbeAllowed()) {
+      return regularProviderAfterCmemCap(platformSource) ?? primary;
+    }
     if (
       settings.CLAUDE_MEM_PRO_FALLBACK_AT
       && isCmemGatewayUrl(settings.CLAUDE_MEM_OPENROUTER_BASE_URL)
-      && staysOnClaudeInFallback(settings.CLAUDE_MEM_PRO_FALLBACK_AT)
+      && gatewayProbeWithheld(settings.CLAUDE_MEM_PRO_FALLBACK_AT)
     ) {
-      return 'claude';
+      return cmemCapExhaustedAt() === null ? 'claude' : regularProviderAfterCmemCap(platformSource) ?? primary;
     }
   }
   return applyQuotaFallback(primary).provider;
@@ -388,7 +398,7 @@ export function quotaServingProvider(held: QuotaProvider, nowMs: number = Date.n
   // only if every route still has a provider serving: a primary that was
   // counting on it may now be waiting.
   const primaries = [globalPrimary(), ...readProviderBySource().values()].filter(isProviderConfigured);
-  const routes = (primaries.includes(held as SelectableProvider) ? [held as SelectableProvider] : primaries).map(routedProviderFor);
+  const routes = (primaries.includes(held as SelectableProvider) ? [held as SelectableProvider] : primaries).map(primary => routedProviderFor(primary));
   if (routes.some(serving => serving === held || isQuotaCooldownHolding(serving, nowMs))) return null;
   return routes[0];
 }
@@ -398,7 +408,7 @@ function quotaProviderDisplayName(provider: string, settings: SettingsDefaults, 
     case 'claude': return auth === 'api-key' ? 'your Anthropic API key' : 'your Claude plan';
     case 'openrouter': return isCmemGatewayUrl(resolveOpenRouterConfig().apiUrl) ? 'cmem.ai' : 'OpenRouter';
     case 'gemini': return 'Gemini';
-    case 'codex': return 'Codex';
+    case 'codex': return 'Codex (your ChatGPT subscription)';
     case 'openai-compatible': {
       const preset = resolveOpenAICompatPreset(settings.CLAUDE_MEM_OPENAI_COMPAT_PRESET);
       return preset.id === 'custom' ? 'your OpenAI-compatible endpoint' : preset.label;
@@ -505,7 +515,7 @@ setSessionProviderResolver(configuredProviderForSource);
  * is not a pause.
  */
 export function selectProviderForGenerator(platformSource?: string): ProviderSelection {
-  return selectForPrimary(primaryFor(platformSource));
+  return selectForPrimary(primaryFor(platformSource), platformSource);
 }
 
 /**
@@ -533,17 +543,44 @@ function isProviderConfigured(provider: SelectableProvider): boolean {
   }
 }
 
+/**
+ * Choose the provider this machine normally uses. If cmem is itself the backup,
+ * only its recovered primary can take over. Explicit backup settings (including
+ * off) win. With no explicit backup a mapped gateway can return to the global
+ * provider, and a Codex session can continue on its signed-in ChatGPT plan.
+ */
+export function regularProviderAfterCmemCap(platformSource?: string): SelectableProvider | null {
+  const primary = primaryFor(platformSource);
+  const available = (candidate: SelectableProvider) => candidate !== 'openrouter'
+    && isFallbackAvailable(candidate) && !isQuotaCooldownHolding(candidate);
+  if (primary !== 'openrouter') return available(primary) ? primary : null;
+
+  if (usesDefaultClaudeBackup()) {
+    const global = globalPrimary();
+    if (available(global)) return global;
+    if (platformSource && normalizePlatformSource(platformSource) === 'codex' && available('codex')) return 'codex';
+  }
+  return quotaFallbackTarget('openrouter');
+}
+
+function selectCapFallback(platformSource?: string): ProviderSelection {
+  const regular = regularProviderAfterCmemCap(platformSource);
+  return regular ? { provider: regular, gatewayProbeClaimId: null, fallbackFrom: 'openrouter' }
+    : { provider: 'openrouter', gatewayProbeClaimId: null, capBlocked: true };
+}
+
 /** Dispatch for an already-chosen primary: the cmem-gateway branch, then the quota fallback. */
-function selectForPrimary(primary: SelectableProvider): ProviderSelection {
+function selectForPrimary(primary: SelectableProvider, platformSource?: string): ProviderSelection {
   if (primary !== 'openrouter') return selectWithQuotaFallback(primary);
   const settings = SettingsDefaultsManager.loadFromFile(paths.settings());
   // A spent cmem allowance is one probe a day. Selecting the gateway again
   // on the immediate fallback resume is what re-sent pro_inference_cap_exhausted.
-  if (isCmemGatewayUrl(settings.CLAUDE_MEM_OPENROUTER_BASE_URL) && !cmemCapProbeAllowed()) {
-    return { provider: 'claude', gatewayProbeClaimId: null };
+  if (isCmemGatewayUrl(resolveOpenRouterConfig().apiUrl) && !cmemCapProbeAllowed()) {
+    return selectCapFallback(platformSource);
   }
   if (settings.CLAUDE_MEM_PRO_FALLBACK_AT && isCmemGatewayUrl(settings.CLAUDE_MEM_OPENROUTER_BASE_URL)) {
-    if (staysOnClaudeInFallback(settings.CLAUDE_MEM_PRO_FALLBACK_AT)) {
+    if (gatewayProbeWithheld(settings.CLAUDE_MEM_PRO_FALLBACK_AT)) {
+      if (cmemCapExhaustedAt() !== null) return selectCapFallback(platformSource);
       return { provider: 'claude', gatewayProbeClaimId: null };
     }
     // Window elapsed: exactly one caller re-probes the gateway, the rest stay
@@ -551,6 +588,7 @@ function selectForPrimary(primary: SelectableProvider): ProviderSelection {
     // the marker, a success clears it, and every exit releases the claim.
     const admission = tryAdmitCmemGatewayProbe();
     if (!admission.admitted) {
+      if (cmemCapExhaustedAt() !== null) return selectCapFallback(platformSource);
       return { provider: 'claude', gatewayProbeClaimId: null };
     }
     return { provider: 'openrouter', gatewayProbeClaimId: admission.claimId };
@@ -684,8 +722,8 @@ export function recordCmemFallbackIfEligible(
   logger.info(
     'SESSION',
     rejection
-      ? 'Recorded cmem trial-expiry fallback; dispatch switches to the Claude provider'
-      : 'cmem gateway re-probe failed; memory stays on the Claude provider',
+      ? 'Recorded cmem trial-expiry fallback; dispatch checks the local provider'
+      : 'cmem gateway re-probe failed; the fallback window was renewed',
     { ...detail, fallbackAt },
   );
   return true;

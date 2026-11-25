@@ -1,14 +1,26 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it, mock, spyOn } from 'bun:test';
-import { rmSync } from 'fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'fs';
+import { tmpdir } from 'os';
 import path from 'path';
 
 import { PRO_FALLBACK_NOTICE_MARKER } from '../../../src/shared/cmem-gateway.js';
-import { paths } from '../../../src/shared/paths.js';
 import {
+  SESSION_START_CARD_REQUEST_WAIT_MS,
+  sessionStartCardRequestPath,
+  sessionStartCardSlotClockOf,
+  sessionStartCardSlotPath,
+} from '../../../src/shared/session-start-card-slot.js';
+import { TEAMBRAIN_DISCOVERY_LINE, TEAMBRAIN_DISCOVERY_NOTICE_MARKER } from '../../../src/shared/teambrain.js';
+import { paths } from '../../../src/shared/paths.js';
+import { serverSessionStartBudgetMs } from '../../../src/shared/host-hook-limits.js';
+import {
+  contextCacheDir,
   contextCacheKeys,
   removeContextCache,
+  saveContextProjectCatalog,
   writeContextCache,
 } from '../../../src/shared/context-cache.js';
+import { runOwnedFixture } from '../../helpers/owned-fixture.js';
 import * as realHookSettings from '../../../src/shared/hook-settings.js';
 import * as realOauthToken from '../../../src/shared/oauth-token.js';
 import * as realProjectName from '../../../src/utils/project-name.js';
@@ -35,7 +47,9 @@ const calls: unknown[][] = [];
 let includeAllSources = false;
 let contextProjects = 'current';
 let excludedProjects = '';
-let projectCatalog: string[] | 'reject' = ['other-project', 'repo-project', 'third-project'];
+/** 'reject' throws a non-transport error; 'worker-down' answers as a worker that never became ready. */
+let projectCatalog: string[] | 'reject' | 'worker-down' = ['other-project', 'repo-project', 'third-project'];
+let checkoutPathsByProject: Record<string, string[]> | undefined = {};
 let showTerminalOutput = false;
 let workerUnreachable = false;
 let provider = 'claude';
@@ -45,7 +59,10 @@ let proFallbackAt = '';
 let openRouterBaseUrl = '';
 let staleReason: string | null = null;
 let workerContext = 'context from worker';
+/** What the worker gives the model, when it differs from the terminal render (the `colors=true` request); null when the same. */
+let workerModelContext: string | null = null;
 const outageNoticeRequests: Array<string | undefined> = [];
+let workerUnreachableRecords = 0;
 let setupState: SetupStateFile = { ...realSetupState.INITIAL_SETUP_STATE };
 
 mock.module('../../../src/shared/setup-state.js', () => ({
@@ -81,14 +98,19 @@ mock.module('../../../src/utils/project-name.js', () => ({
 mock.module('../../../src/shared/worker-utils.js', () => ({
   executeWithWorkerFallback: async (...args: unknown[]) => {
     calls.push(args);
-    if (args[0] === '/api/projects') {
+    if (args[0] === '/api/projects' || args[0] === '/api/projects?includeCheckoutPaths=true') {
       if (projectCatalog === 'reject') throw new Error('catalog unavailable');
-      return { projects: projectCatalog };
+      if (projectCatalog === 'worker-down') return { continue: true, reason: 'worker_unreachable' };
+      return { projects: projectCatalog, checkoutPathsByProject, projectMerges: [] };
     }
-    return workerContext;
+    const isTerminalRender = typeof args[0] === 'string' && args[0].includes('colors=true');
+    return workerModelContext !== null && !isTerminalRender ? workerModelContext : workerContext;
   },
   getWorkerPort: () => 37777,
-  isWorkerFallback: () => workerUnreachable,
+  isWorkerFallback: (result: unknown) => workerUnreachable
+    || (typeof result === 'object' && result !== null && (result as { reason?: unknown }).reason === 'worker_unreachable'),
+  isWorkerUnavailableError: realWorkerUtilsSnapshot.isWorkerUnavailableError,
+  recordWorkerUnreachable: async () => ++workerUnreachableRecords,
   consumeWorkerOutageNotice: async (sessionId: string | undefined) => {
     outageNoticeRequests.push(sessionId);
     return 'claude-mem worker unreachable for 3 consecutive hooks';
@@ -111,6 +133,7 @@ beforeEach(() => {
   openRouterBaseUrl = '';
   staleReason = null;
   workerContext = 'context from worker';
+  workerModelContext = null;
   setupState = { ...realSetupStateSnapshot.INITIAL_SETUP_STATE };
 });
 
@@ -184,11 +207,79 @@ describe('contextHandler SessionStart path', () => {
       calls.length = 0;
       return contextHandler.execute({ sessionId, cwd: '/tmp/repo', platform: 'claude-code' });
     };
-    beforeEach(() => { contextProjects = 'all'; });
+    const storedCatalogPath = () => path.join(contextCacheDir(), 'project-catalog.json');
+    beforeEach(() => {
+      contextProjects = 'all';
+      rmSync(storedCatalogPath(), { force: true });
+    });
     afterAll(() => {
       contextProjects = 'current';
       excludedProjects = '';
       projectCatalog = ['other-project', 'repo-project', 'third-project'];
+      rmSync(storedCatalogPath(), { force: true });
+    });
+
+    describe('cached all-project context without the worker (#6403)', () => {
+      const allKeys = contextCacheKeys(['cached-project', 'parent-project', 'repo-project'], 'claude', false);
+      const checkoutKeys = contextCacheKeys(['parent-project', 'repo-project'], 'claude', false);
+      const priorCatalog = projectCatalog;
+      afterEach(() => {
+        removeContextCache(allKeys);
+        removeContextCache(checkoutKeys);
+        excludedProjects = '';
+        projectCatalog = priorCatalog;
+        workerUnreachable = false;
+      });
+
+      it('serves the cached all-project block during a catalog outage, then with no worker call at all', async () => {
+        const cachedBody = 'CACHED ALL-PROJECT CONTEXT';
+        writeContextCache(allKeys, cachedBody, Date.now());
+
+        projectCatalog = ['cached-project'];
+        const online = await runAll('catalog-cache-online');
+        expect(online.hookSpecificOutput?.additionalContext).toContain(cachedBody);
+        expect(calls.map(call => call[0])).toEqual(['/api/projects']);
+
+        projectCatalog = 'reject';
+        workerContext = '';
+        const offline = await runAll('catalog-cache-offline');
+        expect(offline.hookSpecificOutput?.additionalContext).toContain(cachedBody);
+        expect(calls).toEqual([]);
+      });
+
+      it('asks neither the catalog nor the inject route on a hit under the stored catalog', async () => {
+        saveContextProjectCatalog(['cached-project', 'parent-project', 'repo-project']);
+        writeContextCache(allKeys, 'SEEDED ALL-PROJECT CONTEXT', Date.now());
+        projectCatalog = 'reject';
+        const result = await runAll('stored-catalog-hit');
+        expect(result.hookSpecificOutput?.additionalContext).toContain('SEEDED ALL-PROJECT CONTEXT');
+        expect(calls).toEqual([]);
+      });
+
+      it('serves the checkout block when the all-project block is too big for this session and the worker is down', async () => {
+        staleReason = 'x'.repeat(2_000);
+        saveContextProjectCatalog(['cached-project', 'parent-project', 'repo-project']);
+        // Over the room the stale-token notice leaves, under the raw limit (as #5672).
+        writeContextCache(allKeys, 'ALL-PROJECT BODY\n' + 'y'.repeat(9_342), Date.now());
+        writeContextCache(checkoutKeys, 'CHECKOUT BODY', Date.now());
+        projectCatalog = 'reject';
+        const result = await runAll('all-project-over-room');
+        const output = result.hookSpecificOutput?.additionalContext ?? '';
+        expect(output).toContain('CHECKOUT BODY');
+        expect(output).not.toContain('ALL-PROJECT BODY');
+        expect(calls.some(call => String(call[0]).startsWith('/api/context/inject'))).toBe(false);
+      });
+
+      it('never serves the stored catalog\'s block when exclusions are set', async () => {
+        excludedProjects = '/srv/work/private';
+        saveContextProjectCatalog(['cached-project', 'parent-project', 'repo-project']);
+        writeContextCache(allKeys, 'ALL-PROJECT BODY', Date.now());
+        projectCatalog = 'reject';
+        const result = await runAll('stored-catalog-excluded');
+        expect(result.hookSpecificOutput?.additionalContext).not.toContain('ALL-PROJECT BODY');
+        // The stored list has no checkout paths, so only the worker's catalog can clear exclusions.
+        expect(calls.some(call => String(call[0]).startsWith('/api/projects'))).toBe(true);
+      });
     });
 
     it('asks the catalog with a bounded timeout and falls back to this checkout when it rejects', async () => {
@@ -218,6 +309,62 @@ describe('contextHandler SessionStart path', () => {
       } finally { excludedProjects = ''; }
     });
 
+    it('skips the timeline when exclusions are configured and the catalog is incomplete or unavailable', async () => {
+      const { SESSION_START_TIMELINE_SKIP_NOTICES } = await import('../../../src/cli/handlers/context.js');
+      const cacheKeys = contextCacheKeys(['parent-project', 'repo-project'], 'claude', false);
+      writeContextCache(cacheKeys, 'UNVERIFIED CHECKOUT TIMELINE', Date.now());
+      checkoutPathsByProject = undefined;
+      excludedProjects = '/srv/work/private';
+      try {
+        const cases = [
+          { catalog: ['private', 'another-project'], skip: 'catalog-incomplete', outage: false },
+          { catalog: 'reject', skip: 'catalog-unavailable', outage: true },
+          { catalog: 'worker-down', skip: 'worker-unreachable', outage: true },
+        ] as const;
+        for (const { catalog, skip, outage } of cases) {
+          projectCatalog = Array.isArray(catalog) ? [...catalog] : catalog;
+          const recordsBefore = workerUnreachableRecords;
+          const outageRequestsBefore = outageNoticeRequests.length;
+          const result = await runAll(`unverified-checkout-${skip}`);
+          const additionalContext = result.hookSpecificOutput?.additionalContext ?? '';
+          expect(additionalContext).not.toContain('UNVERIFIED CHECKOUT TIMELINE');
+          expect(calls.some(call => String(call[0]).startsWith('/api/context/inject'))).toBe(false);
+          // Said out loud to the model and the user, never dropped silently.
+          expect(additionalContext).toContain(SESSION_START_TIMELINE_SKIP_NOTICES[skip]);
+          expect(result.systemMessage).toContain(SESSION_START_TIMELINE_SKIP_NOTICES[skip]);
+          // A worker that never became ready counts toward the outage notice, as the inject call would.
+          expect(workerUnreachableRecords - recordsBefore).toBe(skip === 'worker-unreachable' ? 1 : 0);
+          expect(outageNoticeRequests.slice(outageRequestsBefore)).toEqual(outage ? [`unverified-checkout-${skip}`] : []);
+          if (outage) expect(result.systemMessage).toContain('worker unreachable for 3 consecutive hooks');
+        }
+      } finally {
+        removeContextCache(cacheKeys);
+        excludedProjects = '';
+        checkoutPathsByProject = {};
+      }
+    });
+
+    it('skips both timeline renders when every checkout key reads an excluded directory', async () => {
+      excludedProjects = '/srv/work/private';
+      projectCatalog = ['PARENT-project', 'repo-project'];
+      checkoutPathsByProject = { 'PARENT-project': [excludedProjects], 'repo-project': [excludedProjects] };
+      showTerminalOutput = true;
+      try {
+        await runAll('excluded-aliases');
+        expect(calls.some(call => String(call[0]).startsWith('/api/context/inject'))).toBe(false);
+      } finally { excludedProjects = ''; checkoutPathsByProject = {}; showTerminalOutput = false; }
+    });
+
+    it('renders only allowed observations from the worker checkout catalog', async () => {
+      await runOwnedFixture('tests/fixtures/session-start-project-exclusions.ts', {
+        prefix: 'session-start-exclusions-',
+        env: dataDir => ({
+          CLAUDE_CONFIG_DIR: path.join(dataDir, 'config'), CLAUDE_MEM_WORKER_AUTOSTART: 'false',
+          CLAUDE_MEM_RUNTIME: 'worker', DO_NOT_TRACK: '1',
+        }),
+      });
+    }, 10_000);
+
     it('does not ask the local catalog in server runtime', async () => {
       const { resolveSessionStartProjects } = await import('../../../src/cli/handlers/context.js');
       calls.length = 0;
@@ -226,7 +373,7 @@ describe('contextHandler SessionStart path', () => {
         ['parent-project', 'repo-project'],
         'server',
       );
-      expect(projects).toEqual(['parent-project', 'repo-project']);
+      expect(projects).toEqual({ projects: ['parent-project', 'repo-project'], timelineSkip: null, cacheFallbackProjects: null });
       expect(calls.some(call => call[0] === '/api/projects')).toBe(false);
     });
   });
@@ -510,7 +657,10 @@ describe('contextHandler SessionStart path', () => {
       const result = await contextHandler.execute({ sessionId: 'codex-server-budget', cwd: process.cwd(), platform: 'codex' });
       expect(renderSpy).toHaveBeenCalledTimes(1);
       expect(renderSpy.mock.calls[0][0]).toBe(runtime);
-      expect(renderSpy.mock.calls[0][2]).toEqual({ withTerminalRender: false, timeoutMs: 15_000 });
+      expect(renderSpy.mock.calls[0][2]).toEqual({
+        withTerminalRender: false,
+        timeoutMs: serverSessionStartBudgetMs('codex'),
+      });
       expect(calls).toEqual([]);
       expect(result.hookSpecificOutput).toEqual({ hookEventName: 'SessionStart', additionalContext: '' });
     } finally {
@@ -598,6 +748,264 @@ describe('contextHandler SessionStart path', () => {
     } finally {
       includeAllSources = false;
     }
+  });
+
+  describe('session-start card (the hooks module named a file for the banner)', () => {
+    const timeline = '\x1b[2mAccess Claude-Mem Rules + Tools: ~/.claude-mem/RULES-AND-TOOLS.md\x1b[0m\n\n'
+      + '  \x1b[2m#101\x1b[0m  11:55a  first row\n  \x1b[2m#102\x1b[0m          newest row';
+    const savedPluginData = process.env.CLAUDE_PLUGIN_DATA;
+    let pluginDataDirectory: string;
+    const slotFileOf = (sessionId: string) => sessionStartCardSlotPath(pluginDataDirectory, sessionId, 1794888786050);
+    const start = async (sessionId: string, sessionStartCardFile?: string) => {
+      const { contextHandler } = await import('../../../src/cli/handlers/context.js');
+      return contextHandler.execute({ sessionId, cwd: '/tmp/repo', platform: 'claude-code', sessionSource: 'startup', sessionStartCardFile });
+    };
+
+    beforeEach(async () => {
+      pluginDataDirectory = mkdtempSync(path.join(tmpdir(), 'session-start-card-context-'));
+      process.env.CLAUDE_PLUGIN_DATA = pluginDataDirectory;
+      showTerminalOutput = true;
+      workerContext = timeline;
+      // Once-only lines (the TeamBrain discovery line, the telemetry notice) are used up here.
+      await start('card-prime');
+    });
+    afterEach(() => {
+      rmSync(pluginDataDirectory, { recursive: true, force: true });
+      if (savedPluginData === undefined) delete process.env.CLAUDE_PLUGIN_DATA;
+      else process.env.CLAUDE_PLUGIN_DATA = savedPluginData;
+      showTerminalOutput = false;
+    });
+
+    it('writes the banner to the file and sends one line: the closing line with the rows the card shows', async () => {
+      const whole = await start('card-off');
+      const slotFile = slotFileOf('card-on');
+      const result = await start('card-on', slotFile);
+
+      expect(result.systemMessage).toMatch(/^View Observations Live @ \S+ · 2 lines$/);
+      const { text } = JSON.parse(readFileSync(slotFile, 'utf-8')) as { text: string };
+      expect(text.endsWith(timeline)).toBe(true);
+      expect(text).not.toContain('View Observations Live');
+      // Card and message together are the banner a session without the card gets.
+      expect(`${text}\n\n${result.systemMessage}`).toBe(whole.systemMessage!);
+      // The model's block is the same either way.
+      expect(result.hookSpecificOutput).toEqual(whole.hookSpecificOutput);
+    });
+
+    it('keeps a notice in the message, above the closing line, and out of the card', async () => {
+      setupState = pendingInstall();
+      const slotFile = slotFileOf('card-notice');
+      const result = await start('card-notice', slotFile);
+      const lines = result.systemMessage!.split('\n');
+      expect(lines[0]).toContain('Setup is waiting for your choices:');
+      expect(lines.at(-2)).toBe('');
+      expect(lines.at(-1)).toMatch(/^View Observations Live @ \S+ · 2 lines$/);
+      expect(readFileSync(slotFile, 'utf-8')).not.toContain('Setup is waiting');
+    });
+
+    it('keeps the TeamBrain discovery line in the message and out of the card: it is marked shown now, and the card can still fail to draw', async () => {
+      const discoveryMarker = path.join(paths.dataDir(), TEAMBRAIN_DISCOVERY_NOTICE_MARKER);
+      rmSync(discoveryMarker, { force: true });
+      const slotFile = slotFileOf('card-discovery');
+      const result = await start('card-discovery', slotFile);
+      expect(result.systemMessage!.split('\n')).toEqual([
+        TEAMBRAIN_DISCOVERY_LINE,
+        '',
+        expect.stringMatching(/^View Observations Live @ \S+ · 2 lines$/),
+      ]);
+      expect(readFileSync(slotFile, 'utf-8')).not.toContain(TEAMBRAIN_DISCOVERY_LINE);
+      expect(existsSync(discoveryMarker)).toBe(true);
+    });
+
+    it('sends the whole banner when the file is refused or cannot be written', async () => {
+      const whole = await start('card-off');
+      const anotherSessionsFile = slotFileOf('someone-else');
+      expect((await start('card-refused', anotherSessionsFile)).systemMessage).toBe(whole.systemMessage!);
+      expect(existsSync(anotherSessionsFile)).toBe(false);
+
+      delete process.env.CLAUDE_PLUGIN_DATA;
+      const slotFile = slotFileOf('card-no-data-folder');
+      expect((await start('card-no-data-folder', slotFile)).systemMessage).toBe(whole.systemMessage!);
+      expect(existsSync(slotFile)).toBe(false);
+    });
+
+    it('writes no file when there is no banner to draw', async () => {
+      showTerminalOutput = false;
+      const slotFile = slotFileOf('card-banner-off');
+      const result = await start('card-banner-off', slotFile);
+      expect(result.systemMessage).toBeUndefined();
+      expect(existsSync(slotFile)).toBe(false);
+
+      showTerminalOutput = true;
+      workerUnreachable = true;
+      try {
+        const outage = await start('card-worker-down', slotFileOf('card-worker-down'));
+        expect(outage.systemMessage).toBe('claude-mem worker unreachable for 3 consecutive hooks');
+        expect(existsSync(slotFileOf('card-worker-down'))).toBe(false);
+      } finally { workerUnreachable = false; }
+    });
+
+    it('writes no file and sends the whole banner when the model gets no context: Claude Code then keeps no row the card waits for', async () => {
+      const whole = await start('card-off');
+      workerModelContext = '';
+      const slotFile = slotFileOf('card-no-model-context');
+      const result = await start('card-no-model-context', slotFile);
+      expect(result.hookSpecificOutput?.additionalContext).toBe('');
+      expect(result.systemMessage).toBe(whole.systemMessage!);
+      expect(existsSync(slotFile)).toBe(false);
+    });
+
+    it('leaves a session without the card exactly as it was', async () => {
+      const result = await start('card-off');
+      expect(result.systemMessage).toContain(timeline);
+      expect(result.systemMessage).toMatch(/\n\nView Observations Live @ \S+ · 2 lines$/);
+      expect(existsSync(path.join(pluginDataDirectory, 'session-start-card'))).toBe(false);
+    });
+  });
+
+  // A Team or Enterprise account (#6314): the organization's plugin sends the
+  // SessionStart event past the hooks module, so the event names no file. The
+  // card asked with a request file when the Claude Code process started.
+  describe('session-start card (the event names no file, and the card asked with a request file)', () => {
+    const timeline = '\x1b[2mAccess Claude-Mem Rules + Tools: ~/.claude-mem/RULES-AND-TOOLS.md\x1b[0m\n\n'
+      + '  \x1b[2m#101\x1b[0m  11:55a  first row\n  \x1b[2m#102\x1b[0m          newest row';
+    const savedPluginData = process.env.CLAUDE_PLUGIN_DATA;
+    const savedEntrypoint = process.env.CLAUDE_CODE_ENTRYPOINT;
+    let pluginDataDirectory: string;
+    let slotFolder: string;
+    const start = async (sessionId: string, sessionSource: 'startup' | 'clear' | 'compact' = 'startup', sessionStartCardFile?: string) => {
+      const { contextHandler } = await import('../../../src/cli/handlers/context.js');
+      return contextHandler.execute({ sessionId, cwd: '/tmp/repo', platform: 'claude-code', sessionSource, sessionStartCardFile });
+    };
+    /** The request as the card writes it when the process starts. */
+    const cardAsks = (sessionId: string, askedAtEpochMs: number = Date.now()) => {
+      mkdirSync(slotFolder, { recursive: true });
+      writeFileSync(sessionStartCardRequestPath(pluginDataDirectory, sessionId, askedAtEpochMs), '');
+      return askedAtEpochMs;
+    };
+    const slotsOf = (sessionId: string) => (existsSync(slotFolder) ? readdirSync(slotFolder) : [])
+      .filter(fileName => sessionStartCardSlotClockOf(fileName, sessionId) !== null);
+    const allSlots = () => (existsSync(slotFolder) ? readdirSync(slotFolder) : []).filter(fileName => fileName.endsWith('.json'));
+    /** The hook's limit on its wait for a request, read where the handler reads it. */
+    const hookWaitMs = async () =>
+      (await import('../../../src/cli/session-start-card-slot-writer.js')).SESSION_START_CARD_REQUEST_HOOK_WAIT_MS;
+
+    beforeEach(async () => {
+      pluginDataDirectory = mkdtempSync(path.join(tmpdir(), 'session-start-card-request-context-'));
+      slotFolder = path.join(pluginDataDirectory, 'session-start-card');
+      process.env.CLAUDE_PLUGIN_DATA = pluginDataDirectory;
+      process.env.CLAUDE_CODE_ENTRYPOINT = 'cli';
+      showTerminalOutput = true;
+      workerContext = timeline;
+      // Once-only lines (the TeamBrain discovery line, the telemetry notice) are used up here.
+      await start('request-prime');
+    });
+    afterEach(() => {
+      rmSync(pluginDataDirectory, { recursive: true, force: true });
+      if (savedPluginData === undefined) delete process.env.CLAUDE_PLUGIN_DATA;
+      else process.env.CLAUDE_PLUGIN_DATA = savedPluginData;
+      if (savedEntrypoint === undefined) delete process.env.CLAUDE_CODE_ENTRYPOINT;
+      else process.env.CLAUDE_CODE_ENTRYPOINT = savedEntrypoint;
+      showTerminalOutput = false;
+    });
+
+    it('names the slot itself, writes the banner there and sends one line', async () => {
+      const whole = await start('request-off');
+      const askedAt = cardAsks('request-on');
+      const result = await start('request-on');
+
+      expect(result.systemMessage).toMatch(/^View Observations Live @ \S+ · 2 lines$/);
+      const [slotFileName, ...others] = slotsOf('request-on');
+      expect(others).toEqual([]);
+      // Named by the hook's clock, at or after the request: the card takes no earlier slot for its answer.
+      expect(sessionStartCardSlotClockOf(slotFileName, 'request-on')).toBeGreaterThanOrEqual(askedAt);
+      const { text } = JSON.parse(readFileSync(path.join(slotFolder, slotFileName), 'utf-8')) as { text: string };
+      // Card and message together are the banner a session without the card gets.
+      expect(`${text}\n\n${result.systemMessage}`).toBe(whole.systemMessage!);
+      expect(result.hookSpecificOutput).toEqual(whole.hookSpecificOutput);
+    });
+
+    // The order measured on a Team account: the card writes its request while the hook runs, and in 3 of
+    // 8 starts the hook listed the slot folder first (by 5, 21 and 86 ms).
+    it('waits for a request the card writes after the hook has listed the folder, and sends one line', async () => {
+      const whole = await start('request-off');
+      // An earlier session's request: a card has asked from this plugin data folder before.
+      cardAsks('an-earlier-session', Date.now() - 60_000);
+
+      const startedAt = Date.now();
+      const requestIsLateByMs = 86;
+      let askedAt = 0;
+      const cardWritesLate = setTimeout(() => { askedAt = cardAsks('request-late'); }, requestIsLateByMs);
+      const result = await start('request-late');
+      clearTimeout(cardWritesLate);
+
+      // The hook was waiting when the request came: it returned after it, and within its limit.
+      expect(askedAt).toBeGreaterThanOrEqual(startedAt);
+      expect(Date.now() - startedAt).toBeLessThan(await hookWaitMs());
+      expect(result.systemMessage).toMatch(/^View Observations Live @ \S+ · 2 lines$/);
+      const [slotFileName, ...others] = slotsOf('request-late');
+      expect(others).toEqual([]);
+      // The card's look takes this slot: it is named at or after the request.
+      expect(sessionStartCardSlotClockOf(slotFileName, 'request-late')).toBeGreaterThanOrEqual(askedAt);
+      const { text } = JSON.parse(readFileSync(path.join(slotFolder, slotFileName), 'utf-8')) as { text: string };
+      expect(`${text}\n\n${result.systemMessage}`).toBe(whole.systemMessage!);
+    });
+
+    it('keeps the whole banner as the hook message unless a card of this start asked for it', async () => {
+      const whole = await start('request-off');
+      // The control: a request that stands is answered with one line.
+      cardAsks('request-control');
+      expect((await start('request-control')).systemMessage).not.toBe(whole.systemMessage!);
+      expect(slotsOf('request-control')).toHaveLength(1);
+
+      // No request of this session. A card asked from this folder before (the control's), so the hook waits
+      // its limit for one, and then sends the whole banner: nothing would draw a slot.
+      const waitStartedAt = Date.now();
+      expect((await start('request-none')).systemMessage).toBe(whole.systemMessage!);
+      // Nine tenths of the limit: a timer may fire a fraction of a millisecond early.
+      expect(Date.now() - waitStartedAt).toBeGreaterThanOrEqual((await hookWaitMs()) * 0.9);
+      // Another session's request.
+      cardAsks('request-of-another-session');
+      expect((await start('request-not-mine')).systemMessage).toBe(whole.systemMessage!);
+      // A request that has run out: the card has stopped looking.
+      cardAsks('request-run-out', Date.now() - SESSION_START_CARD_REQUEST_WAIT_MS);
+      expect((await start('request-run-out')).systemMessage).toBe(whole.systemMessage!);
+      // A /clear and a compaction: session.start does not come with them, so no card looks for their banner.
+      cardAsks('request-clear');
+      expect((await start('request-clear', 'clear')).systemMessage).toBe(whole.systemMessage!);
+      cardAsks('request-compact');
+      expect((await start('request-compact', 'compact')).systemMessage).toBe(whole.systemMessage!);
+      // Not the terminal's own screen.
+      cardAsks('request-print-mode');
+      process.env.CLAUDE_CODE_ENTRYPOINT = 'sdk-cli';
+      expect((await start('request-print-mode')).systemMessage).toBe(whole.systemMessage!);
+
+      expect(allSlots()).toEqual(slotsOf('request-control'));
+    });
+
+    it('writes only the file the event names when the SessionStart hook did run: one start, one slot', async () => {
+      // The control: a request alone is answered with a slot the hook names.
+      cardAsks('request-control');
+      await start('request-control');
+      expect(slotsOf('request-control')).toHaveLength(1);
+
+      cardAsks('request-and-named');
+      const namedSlotFile = sessionStartCardSlotPath(pluginDataDirectory, 'request-and-named', 1794888786050);
+      const result = await start('request-and-named', 'startup', namedSlotFile);
+      expect(result.systemMessage).toMatch(/^View Observations Live @ \S+ · 2 lines$/);
+      expect(slotsOf('request-and-named')).toEqual([path.basename(namedSlotFile)]);
+    });
+
+    it('answers no request when there is no banner to draw', async () => {
+      // The control: with a banner, this request is answered.
+      cardAsks('request-control');
+      await start('request-control');
+      expect(slotsOf('request-control')).toHaveLength(1);
+
+      showTerminalOutput = false;
+      cardAsks('request-banner-off');
+      expect((await start('request-banner-off')).systemMessage).toBeUndefined();
+      expect(slotsOf('request-banner-off')).toEqual([]);
+    });
   });
 
   describe('context cache reserve (#5672)', () => {

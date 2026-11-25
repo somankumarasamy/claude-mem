@@ -15,7 +15,7 @@ import { DatabaseManager } from './DatabaseManager.js';
 import { SessionManager } from './SessionManager.js';
 import { randomUUID } from 'crypto';
 import { buildCmemCorrelationHeader, CMEM_CORRELATION_HEADER } from './cmem-request-correlation.js';
-import { ClassifiedProviderError, isClassified, rateLimitUntilNextKey, type ProviderErrorClass } from './provider-errors.js';
+import { CmemAllowanceExhaustedError, ClassifiedProviderError, isClassified, rateLimitUntilNextKey, type ProviderErrorClass } from './provider-errors.js';
 import type { PaidSendBudget } from './paid-send-budget.js';
 import { withRetry, parseRetryAfterMs } from './retry.js';
 import {
@@ -179,6 +179,29 @@ function parseUpstreamErrorEnvelope(bodyText: string): UpstreamErrorEnvelope | n
 }
 
 /**
+ * litellm's words when it could not parse the downstream model's response.
+ * The model ran and was billed; only its output was lost.
+ */
+const UPSTREAM_OUTPUT_FAILURE_MARKERS = ['unable to get json', 'expecting value'];
+
+/**
+ * The status to classify by. Once OpenRouter has accepted a request the HTTP
+ * status is already 200, so a later failure (a rate limit, an overloaded
+ * upstream) arrives as an error envelope in the body whose numeric `error.code`
+ * is the real status. A litellm output failure keeps its 200 whatever its code
+ * (OpenRouter reports an invalid upstream response as a 502): promoting it to
+ * a 5xx would resend it and pay twice.
+ */
+function effectiveStatus(status: number | undefined, envelope: UpstreamErrorEnvelope | null, lowerBody: string): number | undefined {
+  const code = envelope?.code;
+  if (UPSTREAM_OUTPUT_FAILURE_MARKERS.some(marker => lowerBody.includes(marker))) return status;
+  if (status !== undefined && status >= 200 && status < 300 && typeof code === 'number' && code >= 400 && code < 600) {
+    return code;
+  }
+  return status;
+}
+
+/**
  * OpenRouter's answers when the configured model id itself is gone: a retired
  * model (404 "This model has been deprecated. It is recommended to migrate to
  * …", #3659), an id that is not in the catalog (400 "… is not a valid model
@@ -230,13 +253,13 @@ export function classifyOpenRouterError(input: {
   /** The URL a request with no response was sent to, named in the network-error message. */
   requestUrl?: string;
 }): ClassifiedProviderError {
-  const status = input.status;
   const body = input.bodyText ?? '';
   const lower = body.toLowerCase();
   const headers = input.headers;
   const retryAfterHeader = headers?.get('retry-after') ?? null;
   const retryAfterMs = parseRetryAfterMs(retryAfterHeader);
   const envelope = parseUpstreamErrorEnvelope(body);
+  const status = effectiveStatus(input.status, envelope, lower);
 
   // Structured taxonomy envelope from the cmem.ai gateway: carry it verbatim.
   if (envelope && typeof envelope.code === 'string' && Object.prototype.hasOwnProperty.call(GATEWAY_CODE_TO_KIND, envelope.code)) {
@@ -251,7 +274,9 @@ export function classifyOpenRouterError(input: {
     // Preserve the gateway default only for an absent hint. An invalid hint
     // must use ordinary retry backoff rather than reintroducing a full minute.
     const gatewayRetryAfterMs = retryAfterHeader === null ? 60_000 : retryAfterMs;
-    return new ClassifiedProviderError(message, {
+    const ErrorClass = input.status === 402 && code === 'allowance_exhausted' && isCmemGatewayUrl(input.requestUrl)
+      ? CmemAllowanceExhaustedError : ClassifiedProviderError;
+    return new ErrorClass(message, {
       kind,
       cause: input.cause,
       code,
@@ -385,7 +410,7 @@ export function classifyOpenRouterError(input: {
   // only its output was lost. Resending pays for the same work again, so it is
   // an output failure and never retried ("never pay twice"). Kept
   // marker-scoped so it carries its own words in the log.
-  if (lower.includes('unable to get json') || lower.includes('expecting value')) {
+  if (UPSTREAM_OUTPUT_FAILURE_MARKERS.some(marker => lower.includes(marker))) {
     return new ClassifiedProviderError(
       describe('upstream output failure'),
       { kind: 'unrecoverable', paidSendOutcome: 'output_failure', cause: input.cause, ...detail },
@@ -1170,7 +1195,7 @@ export class OpenRouterProvider extends OpenAICompatibleProvider<OpenRouterConfi
     // The gateway emits pro_inference_cap_exhausted on every spent request.
     // After the first refusal, further sends wait until the next day.
     if (isCmemGatewayUrl(apiUrl) && !cmemCapProbeAllowed()) {
-      throw new ClassifiedProviderError('cmem.ai inference allowance is still spent; the next probe is tomorrow', {
+      throw new CmemAllowanceExhaustedError('cmem.ai inference allowance is still spent; the next probe is tomorrow', {
         kind: 'quota_exhausted', code: 'allowance_exhausted', cause: new Error('cap probe withheld'),
       });
     }
@@ -1231,6 +1256,7 @@ export class OpenRouterProvider extends OpenAICompatibleProvider<OpenRouterConfi
         // Per OpenRouter spec, errors can come in 200 responses too.
         throw classifyOpenRouterError({
           status: exchange.status,
+          requestUrl: apiUrl,
           bodyText: JSON.stringify(responseData),
           headers: exchange.headers,
           cause: new Error(`OpenRouter API error: ${responseData.error.code} - ${responseData.error.message}`),
@@ -1247,7 +1273,7 @@ export class OpenRouterProvider extends OpenAICompatibleProvider<OpenRouterConfi
       ...(signal ? { maxRetries: 0 } : {}), ...retryPolicyForPool(poolSize),
     });
     } catch (error) {
-      if (isCmemGatewayUrl(apiUrl) && isClassified(error) && error.code === 'allowance_exhausted') noteCmemCapExhausted();
+      if (error instanceof CmemAllowanceExhaustedError) noteCmemCapExhausted();
       throw error;
     }
 

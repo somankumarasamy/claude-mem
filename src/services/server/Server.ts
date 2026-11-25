@@ -10,11 +10,9 @@ import {
   createForeignPageDeleteGuard,
   createMiddleware,
   createLocalApiTokenGuard,
-  createRemoteReadOnlyGuard,
   createWorkerHostGuard,
   requireLocalhost,
   type LocalApiTokenOptions,
-  type RemoteReadOnlyOptions,
   type WorkerOriginPolicy,
 } from '../worker/http/middleware.js';
 import { errorHandler, notFoundHandler } from './ErrorHandler.js';
@@ -23,9 +21,9 @@ import { isPidAlive } from '../../supervisor/process-registry.js';
 import { ENV_PREFIXES, ENV_EXACT_MATCHES } from '../../supervisor/env-sanitizer.js';
 import { flushResponseThen } from './flushResponseThen.js';
 import { getUptimeSeconds } from '../../shared/uptime.js';
-import { snapshotDependencyHealth, type DependencyHealthSnapshot } from '../../shared/dependency-health.js';
+import { dependencyStatusLabels, snapshotDependencyHealth, type DependencyHealthSnapshot, type DependencyStatus } from '../../shared/dependency-health.js';
 import { globalRateLimitStore } from '../worker/RateLimitStore.js';
-import type { ObservationQueueHealth } from '../../server/queue/queue-health-types.js';
+import type { ObservationQueueHealth, ObservationQueueHealthLaneSnapshot } from '../../server/queue/queue-health-types.js';
 import type { ChromaCrashState } from '../sync/ChromaMcpManager.js';
 import { clearWindowsListenSocketInherit } from '../../shared/windows-listen-socket.js';
 import { TERMINAL_INIT_PHASES, type InitPhaseSource, type InitPhaseState } from './init-phase.js';
@@ -144,21 +142,11 @@ export interface ServerOptions {
   // the in-plugin worker runtime is unchanged; the server runtime sets it.
   securityHeaders?: boolean;
   /**
-   * Observation TV remote broadcast. When present, a guard runs BEFORE every
-   * other middleware and route: loopback requests are untouched, and non-loopback
-   * requests may reach only /tv, /tv.html, /stream and GET /api/observations, and
-   * only with the shared secret. Absent (the default, and the server runtime's
-   * choice — it has its own API-key auth) ⇒ nothing is mounted and behavior is
-   * unchanged.
-   */
-  remoteReadOnly?: RemoteReadOnlyOptions;
-  /**
-   * Local API token mode (#5141). When present, a guard runs before everything else,
-   * the Observation TV guard included, and refuses every request without the
-   * token, loopback too, except the exact routes in shared/local-api-token.ts. A
-   * browser page opened with `?token=` keeps working: see createLocalApiTokenGuard.
-   * Observation TV's remote mode needs the token as well. Absent (the default, and
-   * the server runtime's choice) ⇒ nothing is mounted and behavior is unchanged.
+   * Local API token mode (#5141). When present, a guard runs before everything else
+   * and refuses every request without the token, loopback too, except the exact
+   * routes in shared/local-api-token.ts. A browser page opened with `?token=` keeps
+   * working: see createLocalApiTokenGuard. Absent (the default, and the server
+   * runtime's choice) ⇒ nothing is mounted and behavior is unchanged.
    */
   localApiToken?: LocalApiTokenOptions;
   /**
@@ -189,6 +177,66 @@ export function applySecurityHeaders(res: Response): void {
   res.removeHeader('X-Powered-By');
 }
 
+/**
+ * `/api/health` is unauthenticated on purpose: clients probe it before they
+ * know the worker is up, the installer and the port logic identify the worker
+ * by it, and it is the one route the local API token exempts
+ * (shared/local-api-token.ts). So it publishes the state a probe reads, not
+ * the deployment's internals. #6195 drew the same line for `/v1/info`; here
+ * the internals are the provider auth method (whether authentication is
+ * configured at all), the queue backend's address and key namespace, error
+ * text, and the absolute paths of the worker and each dependency's resolved
+ * executable.
+ * Those stay on the loopback-only `/api/admin/doctor`.
+ */
+/**
+ * The queue answer a probe reads: the engine, Redis's up/down status (the
+ * probe answers 503 when Redis is down, so a prober needs to see that Redis is
+ * the cause) and the per-lane counts. Never the backend's host, port, mode or
+ * key prefix, and never error text, which can quote the address: a Redis
+ * error and a lane's `unavailableReason` both stay on the doctor route.
+ */
+function probeQueueHealth(
+  queue: ObservationQueueHealth | null,
+): {
+  engine: 'bullmq';
+  redis: { status: ObservationQueueHealth['redis']['status'] };
+  lanes?: Array<Omit<ObservationQueueHealthLaneSnapshot, 'unavailableReason'>>;
+} | null {
+  if (!queue) return null;
+  return {
+    engine: queue.engine,
+    redis: { status: queue.redis.status },
+    ...(queue.lanes
+      ? { lanes: queue.lanes.map(({ unavailableReason: _unavailableReason, ...lane }) => lane) }
+      : {}),
+  };
+}
+
+/**
+ * The dependency rows a probe reads. `message` is the fixed public label for
+ * the status (the words `claude-mem status` prints), not the recorded error:
+ * that text can quote a path, such as a CLAUDE_CODE_PATH that points at a
+ * missing file. The recorded message, the resolved executable and its
+ * fingerprint stay on `/api/admin/doctor`, where `claude-mem doctor` reads them.
+ * `remediation` is one of the fixed remedies in dependency-health.ts.
+ */
+function probeDependencies(
+  snapshot: DependencyHealthSnapshot,
+): { degraded: boolean; statuses: Array<Omit<DependencyStatus, 'executablePath' | 'executableFingerprint'>> } {
+  return {
+    degraded: snapshot.degraded,
+    statuses: snapshot.statuses.map(status => ({
+      dependency: status.dependency,
+      kind: status.kind,
+      message: dependencyStatusLabels(status.dependency, status.kind)?.statusCommandHint
+        ?? `${status.dependency}: ${status.kind}`,
+      ...(status.remediation !== undefined ? { remediation: status.remediation } : {}),
+      recordedAtMs: status.recordedAtMs,
+    })),
+  };
+}
+
 export class Server {
   readonly app: Application;
   private server: http.Server | null = null;
@@ -215,6 +263,10 @@ export class Server {
    * worker that still answers from one whose every request hangs.
    */
   private lastResponseFinishedAt: number | null = null;
+  // Set once finalizeRoutes() has mounted the terminal 404 and error handlers.
+  // A route registered after them could never be reached, so registering one
+  // then is an error, not a silent 404.
+  private routesFinalizedFlag = false;
   private readonly options: ServerOptions;
   private readonly startTime: number = Date.now();
 
@@ -227,7 +279,6 @@ export class Server {
     // and every route registered later all mount after this point. Anything
     // mounted afterwards leaves earlier routes uncovered.
     this.setupLocalApiTokenGuard();
-    this.setupRemoteReadOnlyGuard();
     this.setupSecurityHeaders();
     this.setupCors();
     this.setupPreBodyParserRoutes();
@@ -328,10 +379,22 @@ export class Server {
   }
 
   registerRoutes(handler: RouteHandler): void {
+    if (this.routesFinalizedFlag) {
+      throw new Error(`Cannot register ${handler.constructor?.name ?? 'routes'} after finalizeRoutes(): the terminal 404 handler would answer every request first`);
+    }
     handler.setupRoutes(this.app);
   }
 
+  get routesFinalized(): boolean {
+    return this.routesFinalizedFlag;
+  }
+
+  /** Mount the terminal 404 and error handlers. Call once, after the last route. */
   finalizeRoutes(): void {
+    if (this.routesFinalizedFlag) {
+      throw new Error('finalizeRoutes() was already called');
+    }
+    this.routesFinalizedFlag = true;
     this.app.use(notFoundHandler);
 
     this.app.use(errorHandler);
@@ -339,10 +402,10 @@ export class Server {
 
   private setupMiddleware(): void {
     // Idle-exit request tracking, ahead of the body parsers and every route
-    // registered from here on. The remote read-only guard, security headers,
+    // registered from here on. The local API token guard, security headers,
     // host/CORS guards and the /api/auth routes mount before it (position
-    // zero belongs to the read-only guard), so a request that only they
-    // answer is not counted; none of those stays open.
+    // zero belongs to the token guard), so a request that only they answer
+    // is not counted; none of those stays open.
     this.app.use((_req: Request, res: Response, next: () => void) => {
       this.trackRequestActivity(res);
       next();
@@ -356,13 +419,6 @@ export class Server {
       return;
     }
     this.app.use(createLocalApiTokenGuard(this.options.localApiToken));
-  }
-
-  private setupRemoteReadOnlyGuard(): void {
-    if (!this.options.remoteReadOnly) {
-      return;
-    }
-    this.app.use(createRemoteReadOnlyGuard(this.options.remoteReadOnly));
   }
 
   private setupSecurityHeaders(): void {
@@ -482,11 +538,11 @@ export class Server {
       const dependencyHealth = this.options.getDependencyHealth
         ? this.options.getDependencyHealth()
         : snapshotDependencyHealth();
+      const probeQueue = probeQueueHealth(queueHealth);
       res.status(queueDegraded ? 503 : 200).json({
         status: queueDegraded ? 'degraded' : 'ok',
         ...(this.options.runtime ? { runtime: this.options.runtime } : {}),
         version: BUILT_IN_VERSION,
-        workerPath: this.options.workerPath,
         uptime: getUptimeSeconds(this.startTime),
         managed: process.env.CLAUDE_MEM_MANAGED === 'true',
         hasIpc: typeof process.send === 'function',
@@ -494,10 +550,12 @@ export class Server {
         pid: process.pid,
         initialized: this.options.getInitializationComplete(),
         mcpReady: this.options.getMcpReady(),
-        ai: this.options.getAiStatus(),
-        dependencies: dependencyHealth,
+        // The provider's name is probe state; the auth method says whether
+        // authentication is configured at all, so it stays off this route.
+        ai: { provider: this.options.getAiStatus().provider },
+        dependencies: probeDependencies(dependencyHealth),
         rateLimits: globalRateLimitStore.getMostRecentByWindow(),
-        ...(queueHealth ? { queue: queueHealth } : {}),
+        ...(probeQueue ? { queue: probeQueue } : {}),
       });
     });
 
@@ -586,7 +644,7 @@ export class Server {
       }
     });
 
-    this.app.get('/api/admin/doctor', requireLocalhost, (_req: Request, res: Response) => {
+    this.app.get('/api/admin/doctor', requireLocalhost, async (_req: Request, res: Response) => {
       const supervisor = getSupervisor();
       const registry = supervisor.getRegistry();
       const allRecords = registry.getAll();
@@ -610,6 +668,9 @@ export class Server {
       const minutes = Math.floor((uptimeSeconds % 3600) / 60);
       const formattedUptime = hours > 0 ? `${hours}h ${minutes}m` : `${minutes}m`;
       const chromaCrashState = this.options.getChromaCrashState?.();
+      const queueHealth = this.options.getQueueHealth
+        ? await this.options.getQueueHealth()
+        : null;
 
       res.json({
         supervisor: {
@@ -624,6 +685,11 @@ export class Server {
           dependencies: this.options.getDependencyHealth
             ? this.options.getDependencyHealth()
             : snapshotDependencyHealth(),
+          // The detail /api/health deliberately leaves off its unauthenticated
+          // answer. This route is loopback-only, so `worker status` can read it
+          // here without publishing it to every peer on the network.
+          ...(this.options.workerPath ? { workerPath: this.options.workerPath } : {}),
+          ...(queueHealth ? { queue: queueHealth } : {}),
           ...(chromaCrashState
             ? { chroma: chromaCrashState }
             : {}),

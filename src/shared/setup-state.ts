@@ -1,20 +1,30 @@
 // The install funnel's state, shared by the worker (which the setup page talks to) and the installer (which waits
 // on it). One file per machine: the funnel shows until `status` is `complete`, for new installs and upgrades alike.
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { isCmemGatewayUrl } from './cmem-gateway.js';
 import { resolveDataDir } from './paths.js';
 import { randomUUID } from 'node:crypto';
 import type { SetupInstallState } from './setup-install.js';
+import type { SetupUsage } from './setup-usage.js';
 import {
-  isSetupId, type SetupBranch, type SetupCheckoutState, type SetupInstallerStage, type SetupMemoryBilling,
+  isSetupId, type SetupBranch, type SetupCheckoutState, type SetupCloudSyncOffer, type SetupInstallerStage, type SetupMemoryBilling,
   type SetupStatus, type SetupTelemetryContext,
 } from './setup-funnel.js';
 
 // The states themselves are defined in setup-funnel.ts, which the setup page can also load.
 export type { SetupBranch, SetupCheckoutState, SetupInstallerStage, SetupMemoryBilling, SetupStatus };
 
-export interface SetupChoice { branch: SetupBranch; memoryBilling: SetupMemoryBilling; chosenAt: string }
+export interface SetupChoice {
+  branch: SetupBranch;
+  memoryBilling: SetupMemoryBilling;
+  cloudSyncOffer?: SetupCloudSyncOffer;
+  /** The owner chose the standalone offer that includes sharing the Work View board. */
+  shareWorkView?: true;
+  chosenAt: string;
+  /** Original scan summary for the post-checkout usage screen, retained across worker restarts. */
+  usage?: SetupUsage;
+}
 export interface SetupInstallerReport { stage: SetupInstallerStage; error: string | null; updatedAt: string }
 export interface SetupCheckout { state: SetupCheckoutState; requests: number; error: string | null; updatedAt: string }
 
@@ -121,9 +131,16 @@ export function writeSetupState(state: SetupStateFile, path: string = setupState
 
 function writeJsonAtomically(path: string, value: unknown): void {
   mkdirSync(dirname(path), { recursive: true });
-  const temp = `${path}.${process.pid}.tmp`;
-  writeFileSync(temp, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
-  renameSync(temp, path);
+  const temp = `${path}.${randomUUID()}.tmp`;
+  try {
+    writeFileSync(temp, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600, flag: 'wx' });
+    renameSync(temp, path);
+  } catch (error) {
+    // A failed write or rename (Windows EPERM/EBUSY while the target is held)
+    // would otherwise leave this randomly named temp behind on every attempt.
+    try { unlinkSync(temp); } catch { /* the temp may not exist */ }
+    throw error;
+  }
 }
 
 const filled = (value: unknown): boolean => typeof value === 'string' && value.trim().length > 0;

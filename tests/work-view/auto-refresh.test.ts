@@ -6,14 +6,18 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { AutoRefreshWorker, refreshIntervalMs } from '../../src/services/work-view/auto-refresh-worker.mjs';
-import { buildRefreshTask, decidedTextLanguage, FOCUS_ANSWER_SCHEMA, GROUPING_ANSWER_SCHEMA, resolveRefreshAgents, resolveStepModels, reviewConcurrency, STEP_MODEL_SETTINGS, STEP_MODELS } from '../../src/services/work-view/refresh-task.js';
+import { buildRefreshTask, decidedTextLanguage, FOCUS_ANSWER_SCHEMA, GROUPING_ANSWER_SCHEMA, resolveRefreshAgents, resolveStepModels, reviewConcurrency, STEP_MODEL_SETTINGS, STEP_MODELS, TITLE_ANSWER_SCHEMA } from '../../src/services/work-view/refresh-task.js';
 import { logger } from '../../src/utils/logger.js';
-import { readLedger, runCli } from '../../src/services/work-view/request-groups.mjs';
+import { cutOutputText, MAX_STREAM_CHARS } from '../../src/services/agent-runner/detect.js';
+import { groupIdFor, readLedger, runCli } from '../../src/services/work-view/request-groups.mjs';
 import { scratchDir } from '../helpers/scratch-dir.js';
 import { everyRequestInOther, focusInputFrom, focusWriter, isOtherPass } from '../helpers/fake-focus-writer.js';
 import { FOCUS_BATCH } from '../../src/services/work-view/request-groups.mjs';
 import { readFocus } from '../../src/services/work-view/data-source.mjs';
+import { OWNER_GOALS_QUESTION_BYTES } from '../../src/services/work-view/owner-goals-batches.js';
 import { registerSharedFileWriter } from '../../src/services/work-view/shared-file-hooks.mjs';
+import { SessionStore } from '../../src/services/sqlite/SessionStore.js';
+import { SharedLedgerAdapter } from '../../src/services/work-view/shared-ledger-adapter.mjs';
 
 const DAY = 86400000, NOW = 100 * DAY;
 afterEach(() => setFakeSpawn(null));
@@ -63,8 +67,8 @@ function reviewAll(prompt: string) {
 function defaultAnswer(prompt: string) {
   if (prompt.includes('Do only section 1')) return JSON.stringify({ groups: [{ title: 'Release cards', conversations: [key('a')] }] });
   if (prompt.includes('Do only section 2')) return reviewAll(prompt);
-  if (prompt.includes('Do only section 3')) return everyRequestInOther(prompt);
-  if (prompt.includes('Do only section 4')) return JSON.stringify({ narrative: 'Started.', preferences: [] });
+  if (prompt.includes('Do only section 4')) return everyRequestInOther(prompt);
+  if (prompt.includes('Do only section 5')) return JSON.stringify({ narrative: 'Started.', preferences: [] });
   throw new Error(`Unexpected prompt: ${prompt.slice(-200)}`);
 }
 
@@ -126,6 +130,68 @@ describe('automatic refresh scheduler', () => {
       writeFileSync(join(dir, 'request-groups.json'), JSON.stringify({ version: 1, conversations: {}, groups: {}, ignored: {} }));
       expect(await worker.runNow({ reason: 'setup-scan' })).toBe('ok');
       expect(ran).toBe(true);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('the scheduled check replaces a refresh.json that cannot be read, whether or not something is due', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'auto-refresh-'));
+    try {
+      const database = fixtureDatabase();
+      saveGoals(database, new Date(NOW).toISOString());
+      writeFileSync(join(dir, 'request-groups.json'), JSON.stringify({ version: 1, conversations: {}, groups: {}, ignored: { [key('a')]: 'not a goal' } }));
+      const notJson = Buffer.from([0xef, 0xbf, 0xbd, 0xff, 0x00]);
+      writeFileSync(join(dir, 'refresh.json'), notJson);
+      const logs: string[] = [];
+      let runs = 0;
+      const worker = new AutoRefreshWorker({ localDeviceId: () => '', dir, openDatabase: handle(database), now: () => NOW, log: (_level: string, message: string) => { logs.push(message); }, runJob: async () => { runs++; return { state: 'ok', agent: null, result: null, error: null }; } });
+      expect(worker.status).toThrow();
+      expect(await worker.check()).toBe('idle');
+      expect(worker.status()).toMatchObject({ state: 'idle', needs: { needed: false } });
+      expect(logs).toContain('Work view refresh status could not be read; a new status replaces it');
+
+      // Something due: the run starts and writes its own status over the bad file.
+      writeFileSync(join(dir, 'request-groups.json'), JSON.stringify({ version: 1, conversations: {}, groups: {}, ignored: {} }));
+      writeFileSync(join(dir, 'refresh.json'), notJson);
+      expect(await worker.check()).toBe('ok');
+      expect(runs).toBe(1);
+      expect(worker.status()).toMatchObject({ state: 'ok' });
+      expect(worker.status().failures).toBeUndefined();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('the scheduled check also replaces an unreadable refresh.json while Shared My Work stages every write', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'auto-refresh-shared-'));
+    const directory = join(dir, 'work-view');
+    mkdirSync(directory);
+    const store = new SessionStore(join(dir, 'memory.db'));
+    store.setLocalSyncDeviceId('device-a');
+    const adapter = new SharedLedgerAdapter(store.db, { directory, deviceId: 'device-a' });
+    const unregister = registerSharedFileWriter(directory, (name: string, value: unknown) => adapter.beforeWrite(name, value));
+    try {
+      const database = fixtureDatabase();
+      saveGoals(database, new Date(NOW).toISOString());
+      writeFileSync(join(directory, 'request-groups.json'), JSON.stringify({ version: 1, conversations: {}, groups: {}, ignored: { [key('a')]: 'not a goal' } }));
+      // No my_work_file_state row for refresh.json yet, so staging must read the damaged file's observed hash.
+      expect(store.db.prepare('SELECT 1 FROM my_work_file_state WHERE name = ?').get('refresh.json')).toBeNull();
+      writeFileSync(join(directory, 'refresh.json'), Buffer.from([0xef, 0xbf, 0xbd, 0xff, 0x00]));
+      const worker = new AutoRefreshWorker({ localDeviceId: () => 'device-a', dir: directory, openDatabase: handle(database), now: () => NOW, log: () => {}, runJob: async () => ({ state: 'ok', agent: null, result: null, error: null }) });
+      expect(await worker.check()).toBe('idle');
+      expect(worker.status()).toMatchObject({ state: 'idle', needs: { needed: false } });
+    } finally {
+      unregister();
+      store.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a refresh.json that cannot be opened (not a parse error) still fails the scheduled check loudly', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'auto-refresh-'));
+    try {
+      const database = fixtureDatabase();
+      saveGoals(database, new Date(NOW).toISOString());
+      const worker = new AutoRefreshWorker({ localDeviceId: () => '', dir, openDatabase: handle(database), now: () => NOW, log: () => {}, runJob: async () => ({ state: 'ok', agent: null, result: null, error: null }) });
+      spyOn(worker, 'status').mockImplementation(() => { throw Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' }); });
+      await expect(worker.check()).rejects.toThrow('EACCES');
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
@@ -361,8 +427,8 @@ describe('refresh task', () => {
           expect(prompt).toMatch(/milestones has 13 items/);
           return JSON.stringify({ reviews: [oversizedReview(show)] });
         }
-        if (prompt.includes('Do only section 3')) return everyRequestInOther(prompt);
-        if (prompt.includes('Do only section 4')) return JSON.stringify({ narrative: 'One request is under way.', preferences: [] });
+        if (prompt.includes('Do only section 4')) return everyRequestInOther(prompt);
+        if (prompt.includes('Do only section 5')) return JSON.stringify({ narrative: 'One request is under way.', preferences: [] });
         throw new Error(`Unexpected prompt: ${prompt.slice(-200)}`);
       };
       expect(await task.run(ask, 'gemini')).toBe('1 new conversations grouped, 1 requests reviewed (6 oversized fields trimmed after retry), 1 requests placed, story written.');
@@ -409,8 +475,8 @@ describe('refresh task', () => {
         const [show] = JSON.parse(prompt.split(`--- ${file} ---\n`)[1]);
         return JSON.stringify({ reviews: [answerReview(show, reviewAttempts++)] });
       }
-      if (prompt.includes('Do only section 3')) return everyRequestInOther(prompt);
-      if (prompt.includes('Do only section 4')) return JSON.stringify({ narrative: 'One request is under way.', preferences: [] });
+      if (prompt.includes('Do only section 4')) return everyRequestInOther(prompt);
+      if (prompt.includes('Do only section 5')) return JSON.stringify({ narrative: 'One request is under way.', preferences: [] });
       throw new Error(`Unexpected prompt: ${prompt.slice(-200)}`);
     }, 'gemini');
   };
@@ -425,6 +491,47 @@ describe('refresh task', () => {
       expect(saved.percent).toBe(40);
       expect(saved.coercedFields).toBeUndefined();
     } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('a retry still carrying a preference without a quote saves the review without it and says so', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'auto-refresh-unquoted-'));
+    try {
+      const review = (show: any) => ({ groupId: show.groupId, state: 'in-progress', percent: 40, summary: 'Cards are being built.', reviewBasis: show.reviewBasis,
+        preferences: [{ kind: 'directive', preference: 'Short replies.', quote: 'keep it short', at: null }, { kind: 'directive', preference: 'Tests first.', quote: '', at: null }] });
+      const summary = await runRefreshWithReviewAnswers(dir, show => review(show));
+      expect(summary).toBe('1 new conversations grouped, 1 requests reviewed (1 preferences without a quote or text dropped after retry), 1 requests placed, story written.');
+      const [saved] = Object.values(readLedger(dir).progress) as any[];
+      expect(saved.preferences.map((preference: any) => preference.preference)).toEqual(['Short replies.']);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('a story preference over its cap is refused once, trimmed on the retry with the others kept, and the result says so', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'auto-refresh-story-trim-'));
+    const database = fixtureDatabase();
+    try {
+      const long = 'Show honest empty states and never fabricate fallback data. '.repeat(4).slice(0, 201);
+      const story = JSON.stringify({ narrative: 'One request is under way.', preferences: [
+        { preference: 'Keep me.', kind: 'directive', supportCount: 2, quotes: [] },
+        { preference: long, kind: 'directive', supportCount: 1, quotes: [] },
+      ] });
+      const task = buildRefreshTask({ localDeviceId: () => '', needs: { due: 0, ungrouped: 1, goalsStale: false, unplaced: 0, needed: true }, reason: 'scheduled', dataDir: dir, ledgerDir: dir, pluginRoot: PLUGIN_ROOT, openDatabase: handle(database), now: () => NOW, saveFocus: focusWriter(database).save });
+      const storyPrompts: string[] = [];
+      const summary = await task.run(async (prompt: string) => {
+        if (prompt.includes('Do only section 1')) return JSON.stringify({ groups: [{ title: 'Release cards', conversations: [key('a')] }] });
+        if (prompt.includes('Do only section 2')) return reviewAll(prompt);
+        if (prompt.includes('Do only section 4')) return everyRequestInOther(prompt);
+        if (prompt.includes('Do only section 5')) { storyPrompts.push(prompt); return story; }
+        throw new Error(`Unexpected prompt: ${prompt.slice(-200)}`);
+      }, 'gemini');
+      // The same answer twice: the first is refused, the retry is trimmed and saved.
+      expect(storyPrompts).toHaveLength(2);
+      expect(storyPrompts[1]).toContain('preferences[1].preference is 201 characters');
+      expect(summary).toBe('1 new conversations grouped, 1 requests reviewed, 1 requests placed, story written (1 story preferences trimmed after retry).');
+      const saved = readLedger(dir).story.preferences.map((preference: any) => preference.preference);
+      expect(saved[0]).toBe('Keep me.');
+      expect(saved[1].length).toBeLessThanOrEqual(200);
+      expect(saved[1].endsWith('…')).toBe(true);
+    } finally { database.close(); rmSync(dir, { recursive: true, force: true }); }
   });
 
   it('a retry still missing reviewBasis fails the run naming the group and saves no review', async () => {
@@ -585,7 +692,7 @@ describe('focus step', () => {
           expect(other.other.map((request: any) => request.anchor)).toEqual([key('b'), key('c')]);
           return JSON.stringify({ placements: [], proposals: [{ kind: 'new', name: 'Polish', goal: 'The release looks finished.', about: 'Spacing and copy fixes.', anchors: [key('b'), key('c')], sameAs: null, evidence: 'Both are steps of finishing the release.' }] });
         }
-        if (prompt.includes('Do only section 3')) {
+        if (prompt.includes('Do only section 4')) {
           const input = focusInputFrom(prompt);
           expect(JSON.parse(readFileSync(/also saved in (.+?\.json)/.exec(prompt)![1], 'utf8'))).toEqual(input);
           expect(input.areas.map((area: any) => area.focusAreaId)).toEqual(['fa_cards0000001']);
@@ -599,10 +706,10 @@ describe('focus step', () => {
         return JSON.stringify({ narrative: 'Started.', preferences: [] });
       };
       expect(await task.run(ask, 'codex')).toBe('3 requests reviewed, 3 requests placed, 1 focus areas suggested, story written.');
-      const focusSteps = steps.filter(step => step.prompt.includes('Do only section 3'));
+      const focusSteps = steps.filter(step => step.prompt.includes('Do only section 4'));
       expect(focusSteps).toHaveLength(3);
       for (const step of focusSteps) { expect(step.models).toBe(STEP_MODELS.focus); expect(step.schema).toBe(FOCUS_ANSWER_SCHEMA); }
-      expect(steps.map(step => /Do only section (\d)/.exec(step.prompt)?.[1] ?? 'review')).toEqual(['2', '3', '3', '3', '4']);
+      expect(steps.map(step => /Do only section (\d)/.exec(step.prompt)?.[1] ?? 'review')).toEqual(['2', '4', '4', '4', '5']);
       expect(task.steps.map(timing => timing.step)).toEqual(['review', 'focus', 'focus', 'story']);
       // Only accepted answers reached the worker's write: the placement batch and the Other pass.
       expect(writer.bodies).toHaveLength(2);
@@ -630,7 +737,7 @@ describe('focus step', () => {
       const ask = async (prompt: string) => {
         if (prompt.includes('Do only section 2')) return reviewAll(prompt);
         if (isOtherPass(prompt)) return JSON.stringify({ placements: [], proposals: [] });
-        if (prompt.includes('Do only section 3')) {
+        if (prompt.includes('Do only section 4')) {
           const input = focusInputFrom(prompt);
           batches.push(input.requests.length);
           // The second batch's answers keep leaving a request out.
@@ -666,7 +773,7 @@ describe('focus step', () => {
         if (prompt.includes('Do only section 2')) return reviewAll(prompt);
         if (isOtherPass(prompt)) return JSON.stringify({ placements: [], proposals: [] });
         // Every focus answer leaves requests out, so focus is refused twice.
-        if (prompt.includes('Do only section 3')) return JSON.stringify({ placements: [], proposals: [] });
+        if (prompt.includes('Do only section 4')) return JSON.stringify({ placements: [], proposals: [] });
         // The story's agent call itself crashes, which on its own would let the runner try the next agent.
         throw new Error('Claude Code stopped: socket hang up');
       };
@@ -732,8 +839,8 @@ describe('story repair', () => {
           const [show] = JSON.parse(readFileSync(/is in (.+?\.json)/.exec(prompt)![1], 'utf8'));
           return JSON.stringify({ reviews: [{ groupId: show.groupId, state: 'in-progress', percent: 40, summary: 'Release cards are being built.', reviewBasis: show.reviewBasis }] });
         }
-        if (prompt.includes('Do only section 3')) return everyRequestInOther(prompt);
-        expect(prompt).toContain('Do only section 4');
+        if (prompt.includes('Do only section 4')) return everyRequestInOther(prompt);
+        expect(prompt).toContain('Do only section 5');
         if (storyAttempts++ === 0) return rejected;
         expect(prompt).toContain('Your previous answer was refused:');
         expect(prompt).toContain('12000');
@@ -744,6 +851,231 @@ describe('story repair', () => {
       expect(storyAttempts).toBe(2);
       expect(readLedger(dir).story.narrative).toBe('Verified release evidence retained.');
       expect(readLedger(dir).story.preferences).toEqual(preferences);
+    } finally { database.close(); rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
+describe('story in parts (#6226)', () => {
+  /** A database holding only `count` sessions, one per request the story tests seed. */
+  function storyDatabase(count: number) {
+    const db = new Database(':memory:');
+    db.exec(`CREATE TABLE sdk_sessions (id INTEGER PRIMARY KEY, platform_source TEXT, content_session_id TEXT, memory_session_id TEXT, project TEXT, user_prompt TEXT, started_at_epoch INTEGER);
+      CREATE TABLE user_prompts (id INTEGER PRIMARY KEY, session_db_id INTEGER, prompt_number INTEGER, prompt_text TEXT, created_at_epoch INTEGER);
+      CREATE TABLE tool_uses (id INTEGER PRIMARY KEY, session_db_id INTEGER, tool_name TEXT, tool_input TEXT, created_at_epoch INTEGER);
+      CREATE TABLE observations (id INTEGER PRIMARY KEY, memory_session_id TEXT, type TEXT, title TEXT, subtitle TEXT, created_at_epoch INTEGER);
+      CREATE TABLE work_state_entries (id INTEGER PRIMARY KEY, project TEXT, list_name TEXT, fields TEXT, created_at_epoch INTEGER);`);
+    for (let index = 0; index < count; index++) {
+      db.prepare('INSERT INTO sdk_sessions VALUES (?, ?, ?, ?, ?, ?, ?)').run(index + 1, 'claude', `s${index}`, `m${index + 1}`, 'repo/tree', `Build feature ${index}`, NOW - 3 * DAY);
+      db.prepare('INSERT INTO user_prompts (session_db_id, prompt_number, prompt_text, created_at_epoch) VALUES (?, ?, ?, ?)').run(index + 1, 1, `Build feature ${index}`, NOW - 3 * DAY);
+    }
+    return db;
+  }
+
+  /** A review at the validators' bounds, about 21 KB stored: a few hundred of them outgrow any model's window. */
+  const bigReview = (show: any) => ({
+    groupId: show.groupId, state: 'in-progress', percent: 40,
+    summary: 'S'.repeat(280),
+    narrative: 'N'.repeat(1200),
+    startedAt: new Date(NOW - 10 * DAY).toISOString(), shippedAt: null, lastActivityAt: new Date(NOW - DAY).toISOString(),
+    milestones: Array.from({ length: 12 }, (_, i) => ({ at: null, text: `M${i} ` + 'm'.repeat(190), evidence: [] })),
+    preferences: Array.from({ length: 10 }, (_, i) => ({ kind: 'directive', preference: `P${i} ` + 'p'.repeat(190), quote: 'q'.repeat(300), at: null })),
+    outcome: { landed: null, usage: null, value: null, regressions: [], changes: Array.from({ length: 12 }, (_, i) => ({ what: 'w'.repeat(200), why: 'y'.repeat(400), at: null, evidence: [] })) },
+    evidence: [],
+    reviewBasis: show.reviewBasis,
+  });
+
+  /** `count` one-conversation requests, each with a large review recorded at NOW, so every one has moved. */
+  function seedMovedReviews(database: Database, dir: string, count: number): string[] {
+    const sessions = Array.from({ length: count }, (_, index) => `s${index}`);
+    const decisions = join(dir, 'decisions.json');
+    writeFileSync(decisions, JSON.stringify({ groups: sessions.map(session => ({ title: `Request ${session}`, conversations: [key(session)] })) }));
+    runCli(['apply', decisions], { dir, database, now: NOW, print: () => {} });
+    const groupIds = Object.keys(readLedger(dir).groups.groups);
+    for (const groupId of groupIds) {
+      let show: any;
+      runCli(['show', groupId], { dir, database, now: NOW, print: value => { show = value; } });
+      const reviewPath = join(dir, `review-${groupId}.json`);
+      writeFileSync(reviewPath, JSON.stringify(bigReview(show)));
+      runCli(['record-progress', reviewPath], { dir, database, now: NOW, print: () => {} });
+    }
+    return groupIds;
+  }
+
+  /** A fake agent for the seeded refreshes: focus places everything in Other, and the story step records
+   * each question's input and answers with a numbered narrative, carrying the preferences it was given. */
+  function storyAskRecorder() {
+    const asks: Array<{ bytes: number; input: any }> = [];
+    const ask = async (prompt: string) => {
+      if (prompt.includes('Do only section 4')) return everyRequestInOther(prompt);
+      if (prompt.includes('Do only section 5')) {
+        const file = /output is in (.+?\.json)/.exec(prompt)![1];
+        const input = JSON.parse(prompt.split(`--- ${file} ---\n`)[1]);
+        asks.push({ bytes: Buffer.byteLength(prompt, 'utf8'), input });
+        const carried = (input.previousStory?.preferences ?? []).map((preference: any) => ({ preference: preference.preference, kind: preference.kind, supportCount: preference.supportCount, quotes: preference.quotes ?? [] }));
+        if (!carried.length) carried.push({ preference: 'Keep parts small.', kind: 'directive', supportCount: 1, quotes: [] });
+        return JSON.stringify({ narrative: `Narrative from part ${asks.length}.`, preferences: carried });
+      }
+      throw new Error(`Unexpected prompt: ${prompt.slice(-200)}`);
+    };
+    return { asks, ask };
+  }
+
+  const storyTask = (database: Database, dir: string, unplaced: number, clock: () => number = () => NOW) => buildRefreshTask({ localDeviceId: () => '', needs: { due: 0, ungrouped: 0, goalsStale: false, unplaced, needed: true }, reason: 'scheduled', dataDir: dir, ledgerDir: dir, pluginRoot: PLUGIN_ROOT, openDatabase: handle(database), now: clock, saveFocus: focusWriter(database).save });
+
+  it('writes the story in parts when every moved review in one question would exceed the budget', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'auto-refresh-story-parts-'));
+    const database = storyDatabase(60);
+    try {
+      const groupIds = seedMovedReviews(database, dir, 60);
+      const { asks, ask } = storyAskRecorder();
+      const task = storyTask(database, dir, 60);
+      expect(await task.run(ask, 'api')).toBe('60 requests placed, story written in 3 parts.');
+      // Every question, as the api agent receives it with the input inlined, fits the budget.
+      expect(asks).toHaveLength(3);
+      for (const entry of asks) expect(entry.bytes).toBeLessThanOrEqual(OWNER_GOALS_QUESTION_BYTES);
+      // Every moved review reached the story step exactly once.
+      const seen = asks.flatMap(entry => entry.input.reviews.map((review: any) => review.groupId));
+      expect(seen).toHaveLength(60);
+      expect([...seen].sort()).toEqual([...groupIds].sort());
+      // The first part writes; each later part updates the story the part before returned.
+      expect(asks[0].input.update).toBe(false);
+      expect(asks[1].input.update).toBe(true);
+      expect(asks[1].input.previousStory.narrative).toBe('Narrative from part 1.');
+      expect(asks[2].input.previousStory.narrative).toBe('Narrative from part 2.');
+      expect(task.steps.filter(timing => timing.step === 'story')).toHaveLength(3);
+      // Only the last part is recorded, with the preferences the first part returned still in it.
+      const story = readLedger(dir).story;
+      expect(story.narrative).toBe('Narrative from part 3.');
+      expect(story.preferences.map((preference: any) => preference.preference)).toEqual(['Keep parts small.']);
+    } finally { database.close(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('updates a stored story in parts, the first part starting from the stored story', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'auto-refresh-story-parts-update-'));
+    const database = storyDatabase(50);
+    try {
+      const groupIds = seedMovedReviews(database, dir, 50);
+      writeFileSync(join(dir, 'story.json'), JSON.stringify({ narrative: 'The story so far.', preferences: [{ preference: 'Stored preference.', kind: 'directive', supportCount: 1, quotes: [] }], writtenAt: new Date(NOW - DAY).toISOString() }));
+      const { asks, ask } = storyAskRecorder();
+      const task = storyTask(database, dir, 50);
+      expect(await task.run(ask, 'api')).toBe('50 requests placed, story updated in 2 parts.');
+      expect(asks).toHaveLength(2);
+      for (const entry of asks) expect(entry.bytes).toBeLessThanOrEqual(OWNER_GOALS_QUESTION_BYTES);
+      const seen = asks.flatMap(entry => entry.input.reviews.map((review: any) => review.groupId));
+      expect(seen).toHaveLength(50);
+      expect([...seen].sort()).toEqual([...groupIds].sort());
+      expect(asks[0].input.update).toBe(true);
+      expect(asks[0].input.previousStory.narrative).toBe('The story so far.');
+      expect(asks[0].input.previousStory.preferences.map((preference: any) => preference.preference)).toEqual(['Stored preference.']);
+      expect(asks[1].input.previousStory.narrative).toBe('Narrative from part 1.');
+      const story = readLedger(dir).story;
+      expect(story.narrative).toBe('Narrative from part 2.');
+      expect(story.preferences.map((preference: any) => preference.preference)).toEqual(['Stored preference.']);
+    } finally { database.close(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('records the story as of its read, so a review that moves while a later part is written is told next time', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'auto-refresh-story-parts-moved-'));
+    const database = storyDatabase(50);
+    try {
+      const groupIds = seedMovedReviews(database, dir, 50);
+      const LATER = NOW + 60_000;
+      let clock = NOW;
+      const movedWhileWriting = groupIds[0];
+      const { asks, ask } = storyAskRecorder();
+      const task = storyTask(database, dir, 50, () => clock);
+      expect(await task.run(async prompt => {
+        if (prompt.includes('Do only section 5') && asks.length === 1) {
+          // Part 2 is being written: time passes and one review's facts move.
+          clock = LATER;
+          let show: any;
+          runCli(['show', movedWhileWriting], { dir, database, now: LATER, print: value => { show = value; } });
+          const reviewPath = join(dir, 'moved-review.json');
+          writeFileSync(reviewPath, JSON.stringify({ ...bigReview(show), percent: 80 }));
+          runCli(['record-progress', reviewPath], { dir, database, now: LATER, print: () => {} });
+        }
+        return ask(prompt);
+      }, 'api')).toBe('50 requests placed, story written in 2 parts.');
+      // The story is stamped with the time story-input was read, not the time the last part finished.
+      expect(readLedger(dir).story.writtenAt).toBe(new Date(NOW).toISOString());
+      let next: any;
+      runCli(['story-input'], { dir, database, now: LATER, print: value => { next = value; } });
+      expect(next.reviews.map((review: any) => review.groupId)).toEqual([movedWhileWriting]);
+    } finally { database.close(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('a later part that fails leaves the stored story untouched, and the next refresh tells every moved review again', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'auto-refresh-story-parts-failed-'));
+    const database = storyDatabase(50);
+    try {
+      const groupIds = seedMovedReviews(database, dir, 50);
+      writeFileSync(join(dir, 'story.json'), JSON.stringify({ narrative: 'The story so far.', preferences: [{ preference: 'Stored preference.', kind: 'directive', supportCount: 1, quotes: [] }], writtenAt: new Date(NOW - DAY).toISOString() }));
+      const before = readFileSync(join(dir, 'story.json'), 'utf8');
+      let storyAsks = 0;
+      const error = await storyTask(database, dir, 50).run(async prompt => {
+        if (prompt.includes('Do only section 4')) return everyRequestInOther(prompt);
+        if (prompt.includes('Do only section 5')) {
+          storyAsks++;
+          // Part 1 answers well; part 2 answers without a narrative, on its first try and on its retry.
+          return JSON.stringify(storyAsks === 1 ? { narrative: 'Part 1 only.', preferences: [] } : { preferences: [] });
+        }
+        throw new Error(`Unexpected prompt: ${prompt.slice(-200)}`);
+      }, 'api').then(() => null, failure => failure as Error);
+      expect(error).not.toBeNull();
+      expect(storyAsks).toBe(3);
+      // Neither the narrative nor writtenAt moved: part 1's answer was never recorded.
+      expect(readFileSync(join(dir, 'story.json'), 'utf8')).toBe(before);
+      const { asks, ask } = storyAskRecorder();
+      expect(await storyTask(database, dir, 0).run(ask, 'api')).toContain('story updated in 2 parts.');
+      const seen = asks.flatMap(entry => entry.input.reviews.map((review: any) => review.groupId));
+      expect([...seen].sort()).toEqual([...groupIds].sort());
+      expect(asks[0].input.previousStory.narrative).toBe('The story so far.');
+      expect(readLedger(dir).story.narrative).toBe('Narrative from part 2.');
+    } finally { database.close(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('a few moved reviews still go in one question, as before', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'auto-refresh-story-one-part-'));
+    const database = storyDatabase(4);
+    try {
+      seedMovedReviews(database, dir, 4);
+      const { asks, ask } = storyAskRecorder();
+      const task = storyTask(database, dir, 4);
+      expect(await task.run(ask, 'api')).toBe('4 requests placed, story written.');
+      expect(asks).toHaveLength(1);
+      expect(asks[0].input.reviews).toHaveLength(4);
+      expect(task.steps.filter(timing => timing.step === 'story')).toHaveLength(1);
+    } finally { database.close(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('one review too large for any part fails the story step and records nothing', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'auto-refresh-story-oversized-'));
+    const database = fixtureDatabase();
+    try {
+      const decisions = join(dir, 'decisions.json');
+      writeFileSync(decisions, JSON.stringify({ groups: [{ title: 'Release cards', conversations: [key('a')] }] }));
+      runCli(['apply', decisions], { dir, database, now: NOW, print: () => {} });
+      const [groupId] = Object.keys(readLedger(dir).groups.groups);
+      // A stored review past the whole question budget (written directly: record-progress bounds its
+      // fields, so no recorded review can grow this large today).
+      mkdirSync(join(dir, 'progress'), { recursive: true });
+      writeFileSync(join(dir, 'progress', `${groupId}.json`), JSON.stringify({
+        groupId, state: 'in-progress', percent: 40, summary: 'Huge.', narrative: 'x'.repeat(OWNER_GOALS_QUESTION_BYTES + 1024),
+        milestones: [], preferences: [], outcome: null, evidence: [],
+        startedAt: new Date(NOW - 10 * DAY).toISOString(), checkedAt: new Date(NOW).toISOString(), changedAt: new Date(NOW).toISOString(),
+        reviewedThrough: new Date(NOW).toISOString(), reviewedConversations: [key('a')], readings: [{ at: new Date(NOW).toISOString(), percent: 40 }],
+      }));
+      let storyAsked = 0;
+      const task = storyTask(database, dir, 1);
+      const error = await task.run(async prompt => {
+        if (prompt.includes('Do only section 4')) return everyRequestInOther(prompt);
+        if (prompt.includes('Do only section 5')) { storyAsked++; return JSON.stringify({ narrative: 'Never saved.', preferences: [] }); }
+        throw new Error(`Unexpected prompt: ${prompt.slice(-200)}`);
+      }, 'api').then(() => null, failure => failure as Error & { answerRefused?: boolean });
+      expect(error?.message).toContain('One moved review and the story question around it exceed the input budget');
+      expect(error?.answerRefused).toBe(true);
+      expect(storyAsked).toBe(0);
+      expect(readLedger(dir).story).toBeNull();
     } finally { database.close(); rmSync(dir, { recursive: true, force: true }); }
   });
 });
@@ -762,8 +1094,8 @@ describe('review repair', () => {
       const oversized = 'Retain the evidence while shortening this review. ' + 'x'.repeat(1257);
       let attempts = 0, rejectedReview: any, acceptedId = '';
       const ask = async (prompt: string) => {
-        if (prompt.includes('Do only section 4')) return JSON.stringify({ narrative: 'Work continues.' });
-        if (prompt.includes('Do only section 3')) return everyRequestInOther(prompt);
+        if (prompt.includes('Do only section 5')) return JSON.stringify({ narrative: 'Work continues.' });
+        if (prompt.includes('Do only section 4')) return everyRequestInOther(prompt);
         const shows = JSON.parse(readFileSync(/is in (.+?\.json)/.exec(prompt)![1], 'utf8'));
         attempts++;
         if (attempts === 1) {
@@ -783,6 +1115,173 @@ describe('review repair', () => {
       expect(progress[rejectedReview.groupId][field]).toBe('Evidence preserved in a shorter review.');
       expect(progress[rejectedReview.groupId].evidence).toEqual(['observation 42']);
       expect(progress[acceptedId].readings).toHaveLength(1);
+    } finally { database.close(); rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
+describe('grouping repair', () => {
+  it('a retry that still joins without linking the anchor saves the linked parts and leaves the open request as it was', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'auto-refresh-grouping-repair-'));
+    const database = fixtureDatabase();
+    try {
+      for (const [index, session] of ['b', 'c', 'd'].entries()) {
+        database.prepare('INSERT INTO sdk_sessions VALUES (?, ?, ?, ?, ?, ?, ?)').run(index + 2, 'claude', session, `m${index + 2}`, 'repo/tree', `Fix the card layout, part ${session}`, NOW - 2 * DAY);
+        database.prepare('INSERT INTO user_prompts (session_db_id, prompt_number, prompt_text, created_at_epoch) VALUES (?, ?, ?, ?)').run(index + 2, 1, `Fix the card layout, part ${session}`, NOW - 2 * DAY);
+      }
+      const decisions = join(dir, 'decisions.json');
+      writeFileSync(decisions, JSON.stringify({ groups: [{ title: 'Release cards', conversations: [key('a')] }] }));
+      runCli(['apply', decisions], { dir, database, now: NOW - DAY, print: () => {} });
+      const openRequest = readLedger(dir).groups.groups[groupIdFor(key('a'))];
+      // The shape a local OpenAI-compatible model answered twice: its links leave out the open request's anchor,
+      // and one link names a single conversation.
+      const answer = JSON.stringify({ language: 'English', groups: [
+        { title: 'Card layout', conversations: [key('a'), key('b'), key('c')], links: [{ kind: 'agent-judgment', conversations: [key('b'), key('c')], evidence: 'Both fix the card layout.' }] },
+        { title: 'Card colors', conversations: [key('d')], links: [{ kind: 'agent-judgment', conversations: [key('d')], evidence: 'Colors.' }] },
+      ], ignored: [] });
+      const groupingPrompts: string[] = [];
+      const ask = async (prompt: string) => {
+        if (!prompt.includes('Do only section 1')) return defaultAnswer(prompt);
+        groupingPrompts.push(prompt);
+        return answer;
+      };
+      const task = buildRefreshTask({ localDeviceId: () => '', needs: { due: 1, ungrouped: 3, goalsStale: false, unplaced: 0, needed: true }, reason: 'scheduled', dataDir: dir, ledgerDir: dir, pluginRoot: PLUGIN_ROOT, openDatabase: handle(database), now: () => NOW, saveFocus: focusWriter(database).save });
+      expect(await task.run(ask, 'api')).toBe('3 new conversations grouped (2 decisions repaired after retry), 3 requests reviewed, 3 requests placed, story written.');
+      // The first answer is still refused, so the model gets its chance to link the anchor itself.
+      expect(groupingPrompts).toHaveLength(2);
+      expect(groupingPrompts[1]).toContain(`Your previous answer was refused: groups[0] joins ${key('b')}, ${key('c')} without evidence linking it to the anchor.`);
+      const { groups } = readLedger(dir);
+      expect(groups.conversations).toEqual({ [key('a')]: groupIdFor(key('a')), [key('b')]: groupIdFor(key('b')), [key('c')]: groupIdFor(key('b')), [key('d')]: groupIdFor(key('d')) });
+      expect(groups.groups[groupIdFor(key('a'))]).toEqual(openRequest);
+      expect(groups.groups[groupIdFor(key('b'))]).toMatchObject({ title: 'Card layout', anchor: key('b'), links: [{ kind: 'agent-judgment', conversations: [key('b'), key('c')], evidence: 'Both fix the card layout.' }] });
+      expect(groups.groups[groupIdFor(key('d'))]).toMatchObject({ title: 'Card colors', anchor: key('d'), links: [] });
+    } finally { database.close(); rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
+describe('naming step', () => {
+  it('names each request still titled with its ask after the reviews, on the light model; a title refused twice waits for the next run', async () => {
+    const dir = scratchDir('auto-refresh-naming');
+    const database = fixtureDatabase();
+    try {
+      for (const [index, session] of ['b', 'c'].entries()) {
+        database.prepare('INSERT INTO sdk_sessions VALUES (?, ?, ?, ?, ?, ?, ?)').run(index + 2, 'claude', session, `m${index + 2}`, 'repo/tree', `figure out ${session}`, NOW - 2 * DAY);
+        database.prepare('INSERT INTO user_prompts (session_db_id, prompt_number, prompt_text, created_at_epoch) VALUES (?, ?, ?, ?)').run(index + 2, 1, `figure out ${session}`, NOW - 2 * DAY);
+      }
+      // Three requests titled with their asks, as the judge leaves the requests it starts.
+      const decisions = join(dir, 'decisions.json');
+      writeFileSync(decisions, JSON.stringify({ groups: ['a', 'b', 'c'].map(session => ({ title: session === 'a' ? 'Build the release cards' : `figure out ${session}`, conversations: [key(session)] })) }));
+      runCli(['apply', decisions], { dir, database, now: NOW - DAY, print: () => {} });
+      const namings: Array<{ prompt: string; models: unknown; schema: unknown }> = [];
+      const ask = async (prompt: string, models: unknown, schema?: unknown) => {
+        if (!prompt.includes('Do only section 3')) return defaultAnswer(prompt);
+        namings.push({ prompt, models, schema });
+        const input = JSON.parse(/```json\n([\s\S]*?)\n```/.exec(prompt)![1]);
+        // Named from each request's review, which ran first.
+        expect(input.requests.map((request: any) => [request.title, request.summary])).toEqual([['Build the release cards', 'Started.'], ['figure out b', 'Started.'], ['figure out c', 'Started.']]);
+        // The third title is the ask again on both tries.
+        return JSON.stringify({ titles: [
+          { groupId: groupIdFor(key('a')), title: 'Release cards for the launch page' },
+          { groupId: groupIdFor(key('b')), title: 'Fix the checkout page loading error' },
+          { groupId: groupIdFor(key('c')), title: 'Figure out c' },
+        ] });
+      };
+      const options = { localDeviceId: () => '', needs: { due: 3, ungrouped: 0, goalsStale: false, unplaced: 3, needed: true }, reason: 'scheduled', dataDir: dir, ledgerDir: dir, pluginRoot: PLUGIN_ROOT, openDatabase: handle(database), now: () => NOW, saveFocus: focusWriter(database).save };
+      expect(await buildRefreshTask(options).run(ask, 'codex')).toBe('3 requests reviewed, 2 requests named (1 still titled with their ask until the next refresh), 3 requests placed, story written.');
+      expect(namings).toHaveLength(2);
+      expect(namings[1].prompt).toContain('Your previous answer was refused: titles[2].title repeats the owner\'s ask ("figure out c")');
+      for (const naming of namings) { expect(naming.models).toBe(STEP_MODELS.titles); expect(naming.schema).toBe(TITLE_ANSWER_SCHEMA); }
+      expect(STEP_MODELS.titles).toBe(STEP_MODELS.grouping);
+      const { groups } = readLedger(dir);
+      expect(['a', 'b', 'c'].map(session => groups.groups[groupIdFor(key(session))].title)).toEqual(['Release cards for the launch page', 'Fix the checkout page loading error', 'figure out c']);
+
+      // The next run names c. Its placement, made while it showed its ask, still stands: focus is not asked to place it again.
+      const later: string[] = [];
+      expect(await buildRefreshTask(options).run(async (prompt: string) => {
+        later.push(prompt);
+        if (prompt.includes('Do only section 3')) return JSON.stringify({ titles: [{ groupId: groupIdFor(key('c')), title: 'Fix the checkout page for c' }] });
+        return defaultAnswer(prompt);
+      }, 'codex')).toBe('1 requests named.');
+      expect(readLedger(dir).groups.groups[groupIdFor(key('c'))].title).toBe('Fix the checkout page for c');
+      expect(later.filter(prompt => prompt.includes('Do only section 4, steps 1–2'))).toEqual([]);
+    } finally { database.close(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('a naming step refused twice still lets focus and the story run; the run then fails with its error', async () => {
+    const dir = scratchDir('auto-refresh-naming-failure');
+    const database = fixtureDatabase();
+    try {
+      const decisions = join(dir, 'decisions.json');
+      writeFileSync(decisions, JSON.stringify({ groups: [{ title: 'Build the release cards', conversations: [key('a')] }] }));
+      runCli(['apply', decisions], { dir, database, now: NOW - DAY, print: () => {} });
+      const prompts: string[] = [];
+      const task = buildRefreshTask({ localDeviceId: () => '', needs: { due: 1, ungrouped: 0, goalsStale: false, unplaced: 1, needed: true }, reason: 'scheduled', dataDir: dir, ledgerDir: dir, pluginRoot: PLUGIN_ROOT, openDatabase: handle(database), now: () => NOW, saveFocus: focusWriter(database).save });
+      await expect(task.run(async (prompt: string) => {
+        prompts.push(prompt);
+        return prompt.includes('Do only section 3') ? 'No JSON in this answer.' : defaultAnswer(prompt);
+      }, 'codex')).rejects.toThrow(/^titles \(raw answer: /);
+      expect(prompts.filter(prompt => prompt.includes('Do only section 3'))).toHaveLength(2);
+      expect(prompts.filter(prompt => prompt.includes('Do only section 4, steps 1–2'))).toHaveLength(1);
+      expect(readLedger(dir).story?.narrative).toBe('Started.');
+      expect(readLedger(dir).groups.groups[groupIdFor(key('a'))].title).toBe('Build the release cards');
+    } finally { database.close(); rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
+describe('focus proposal repair', () => {
+  /** Requests a–d, one conversation each, and a refresh whose focus step answers with `focusAnswer`. */
+  function refreshWithFocusAnswers(dir: string, database: Database, focusAnswer: (prompt: string) => string) {
+    for (const [index, session] of ['b', 'c', 'd'].entries()) {
+      database.prepare('INSERT INTO sdk_sessions VALUES (?, ?, ?, ?, ?, ?, ?)').run(index + 2, 'claude', session, `m${index + 2}`, 'repo/tree', `Build feature ${session}`, NOW - 2 * DAY);
+      database.prepare('INSERT INTO user_prompts (session_db_id, prompt_number, prompt_text, created_at_epoch) VALUES (?, ?, ?, ?)').run(index + 2, 1, `Build feature ${session}`, NOW - 2 * DAY);
+    }
+    const decisions = join(dir, 'decisions.json');
+    writeFileSync(decisions, JSON.stringify({ groups: ['a', 'b', 'c', 'd'].map(session => ({ title: `Request ${session}`, conversations: [key(session)] })) }));
+    runCli(['apply', decisions], { dir, database, now: NOW, print: () => {} });
+    const task = buildRefreshTask({ localDeviceId: () => '', needs: { due: 4, ungrouped: 0, goalsStale: false, unplaced: 4, needed: true }, reason: 'scheduled', dataDir: dir, ledgerDir: dir, pluginRoot: PLUGIN_ROOT, openDatabase: handle(database), now: () => NOW, saveFocus: focusWriter(database).save });
+    return task.run(async (prompt: string) => {
+      if (prompt.includes('Do only section 2')) return reviewAll(prompt);
+      if (prompt.includes('Do only section 4')) return focusAnswer(prompt);
+      return JSON.stringify({ narrative: 'Started.', preferences: [] });
+    }, 'api');
+  }
+  const proposal = (kind: string, anchors: string[], name: string) => ({ kind, name, goal: 'The release looks finished.', about: 'Fixes.', anchors, sameAs: null, evidence: 'Steps of the release.' });
+
+  it('a retry that still proposes an area the check refuses saves the placements and the other proposals without it', async () => {
+    const dir = scratchDir('auto-refresh-focus-proposal-repair');
+    const database = fixtureDatabase();
+    try {
+      let otherAnswers = 0;
+      // Twice the same answer: a "new" area holding one request beside a sound one.
+      const result = await refreshWithFocusAnswers(dir, database, prompt => {
+        if (!isOtherPass(prompt)) return everyRequestInOther(prompt);
+        otherAnswers++;
+        return JSON.stringify({ placements: [], proposals: [proposal('new', [key('b')], 'Alone'), proposal('new', [key('c'), key('d')], 'Polish')] });
+      });
+      expect(result).toBe('4 requests reviewed, 4 requests placed, 1 focus areas suggested, 1 refused focus area proposals dropped after retry, story written.');
+      expect(otherAnswers).toBe(2);
+      const names = readFocus(database, { localDeviceId: '' }).focusAreas.map(area => area.name);
+      expect(names).toContain('Polish');
+      expect(names).not.toContain('Alone');
+    } finally { database.close(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('a retry that still proposes a name the worker refuses (a nav label) saves the placements without it', async () => {
+    const dir = scratchDir('auto-refresh-focus-nav-repair');
+    const database = fixtureDatabase();
+    try {
+      let placeAnswers = 0;
+      // record-focus's check accepts the name; the worker's write refuses it, since "Other" is a nav label.
+      const result = await refreshWithFocusAnswers(dir, database, prompt => {
+        if (isOtherPass(prompt)) return everyRequestInOther(prompt);
+        placeAnswers++;
+        const placed = JSON.parse(everyRequestInOther(prompt));
+        return JSON.stringify({ ...placed, proposals: [proposal('promote', [key('a')], 'Other things')] });
+      });
+      expect(result).toBe('4 requests reviewed, 4 requests placed, 1 refused focus area proposals dropped after retry, story written.');
+      expect(placeAnswers).toBe(2);
+      const focus = readFocus(database, { localDeviceId: '' });
+      expect(focus.focusAreas.map(area => area.name)).not.toContain('Other things');
+      expect(['a', 'b', 'c', 'd'].map(session => focus.focusAreaIdByAnchor.get(key(session)))).toEqual(['other', 'other', 'other', 'other']);
     } finally { database.close(); rmSync(dir, { recursive: true, force: true }); }
   });
 });
@@ -816,7 +1315,7 @@ describe('My Work text language setting (CLAUDE_MEM_WORK_VIEW_TEXT_LANGUAGE)', (
     for (const settings of [null, { CLAUDE_MEM_WORK_VIEW_TEXT_LANGUAGE: '' }]) {
       const prompts = await runWith(settings);
       // Grouping, review, the two focus passes and the story: nothing spent on deciding a language.
-      expect(sections(prompts)).toEqual(['1', '2', '3', '3', '4']);
+      expect(sections(prompts)).toEqual(['1', '2', '4', '4', '5']);
       expect(prompts.some(prompt => prompt.includes(RULE))).toBe(false);
     }
   });
@@ -825,7 +1324,7 @@ describe('My Work text language setting (CLAUDE_MEM_WORK_VIEW_TEXT_LANGUAGE)', (
     let recorded = '';
     const prompts = await runWith(null, { groupingLanguage: 'English', keepDir: dir => { recorded = readFileSync(join(dir, 'text-language.json'), 'utf8'); } });
     // Still one question per section: the language rides on the grouping question it already asks.
-    expect(sections(prompts)).toEqual(['1', '2', '3', '3', '4']);
+    expect(sections(prompts)).toEqual(['1', '2', '4', '4', '5']);
     expect(prompts[0]).toContain('"language": the human language most of the owner\'s asks are written in');
     for (const prompt of prompts.slice(1)) expect(prompt).toContain(`${RULE} is English.`);
     expect(JSON.parse(recorded).language).toBe('English');
@@ -853,7 +1352,7 @@ describe('My Work text language setting (CLAUDE_MEM_WORK_VIEW_TEXT_LANGUAGE)', (
 
   it('set, every grouping, review, focus and story question names it, with no extra call', async () => {
     const prompts = await runWith({ CLAUDE_MEM_WORK_VIEW_TEXT_LANGUAGE: 'Turkish' });
-    expect(sections(prompts)).toEqual(['1', '2', '3', '3', '4']);
+    expect(sections(prompts)).toEqual(['1', '2', '4', '4', '5']);
     for (const prompt of prompts) expect(prompt).toContain(`${RULE} is Turkish.`);
   });
 
@@ -882,8 +1381,8 @@ describe('parallel reviews', () => {
       let lastPrompt = '';
       const ask = async (prompt: string) => {
         lastPrompt = prompt;
-        if (prompt.includes('Do only section 4')) return JSON.stringify({ narrative: 'Ten features under way.' });
-        if (prompt.includes('Do only section 3')) return everyRequestInOther(prompt);
+        if (prompt.includes('Do only section 5')) return JSON.stringify({ narrative: 'Ten features under way.' });
+        if (prompt.includes('Do only section 4')) return everyRequestInOther(prompt);
         const shows = JSON.parse(readFileSync(/is in (.+?\.json)/.exec(prompt)![1], 'utf8'));
         most = Math.max(most, ++inFlight);
         if (most === 2) bothAsked.resolve();
@@ -945,8 +1444,8 @@ describe('parallel reviews', () => {
       let inFlight = 0, most = 0;
       const lanesFull = deferred<void>();
       const ask = async (prompt: string) => {
-        if (prompt.includes('Do only section 4')) return JSON.stringify({ narrative: 'Forty features under way.' });
-        if (prompt.includes('Do only section 3')) return everyRequestInOther(prompt);
+        if (prompt.includes('Do only section 5')) return JSON.stringify({ narrative: 'Forty features under way.' });
+        if (prompt.includes('Do only section 4')) return everyRequestInOther(prompt);
         const shows = JSON.parse(readFileSync(/is in (.+?\.json)/.exec(prompt)![1], 'utf8'));
         most = Math.max(most, ++inFlight);
         if (inFlight === lanes) lanesFull.resolve();
@@ -1118,6 +1617,42 @@ describe('incremental owner goals', () => {
       expect(prompts).toHaveLength(1);
       expect(prompts[0]).toContain("The owner's language for this run is Turkish.");
     } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('a save_goals.py report past the capture cap fails the goals step once, instead of being parsed or asked again', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'auto-refresh-goals-cut-report-'));
+    const warn = spyOn(logger, 'warn').mockImplementation(() => {});
+    try {
+      const database = fixtureDatabase();
+      saveGoals(database, new Date(NOW - 2 * DAY).toISOString());
+      writeFileSync(join(dir, 'request-groups.json'), JSON.stringify({ version: 1, conversations: {}, groups: {}, ignored: { [key('a')]: 'not a goal' } }));
+      const scriptCalls: string[][] = [];
+      const piece = 'x'.repeat(1024 * 1024);
+      const chattyPython = ((_command: string, args: string[]) => {
+        const child: any = new EventEmitter();
+        child.stdout = Object.assign(new EventEmitter(), { setEncoding() {} }); child.stderr = Object.assign(new EventEmitter(), { setEncoding() {} });
+        if (!args.includes('-c')) scriptCalls.push(args);
+        queueMicrotask(() => {
+          if (!args.includes('-c')) {
+            child.stdout.emit('data', '{"report":"');
+            for (let printed = 0; printed <= MAX_STREAM_CHARS; printed += piece.length) child.stdout.emit('data', piece);
+            child.stdout.emit('data', '"}');
+          }
+          child.emit('close', 0);
+        });
+        return child;
+      }) as any;
+      const task = buildRefreshTask({ localDeviceId: () => '', needs: { due: 0, ungrouped: 0, goalsStale: true, unplaced: 0, needed: true }, reason: 'scheduled', dataDir: dir, ledgerDir: dir, pluginRoot: PLUGIN_ROOT, openDatabase: handle(database), now: () => NOW, spawnImpl: chattyPython, writeOwnerPrompts: fakeOwnerPrompts(3, []) });
+      await task.prepare!();
+      let asked = 0;
+      const ask = async (prompt: string) => {
+        asked++;
+        return readFileSync(/saved goals are in (.+?\.json)/.exec(prompt)![1], 'utf8');
+      };
+      await expect(task.run(ask, 'codex')).rejects.toThrow(cutOutputText('save_goals.py'));
+      expect(asked).toBe(1);
+      expect(scriptCalls).toHaveLength(1);
+    } finally { warn.mockRestore(); rmSync(dir, { recursive: true, force: true }); }
   });
 
   it('a goals-only run names the language an earlier run recorded (#6185)', async () => {
@@ -1416,19 +1951,28 @@ describe('My Work refresh stays on one agent (#5189)', () => {
     await withSettings({ CLAUDE_MEM_PROVIDER: 'gemini' }, dir => expect(resolveRefreshAgents(dir)).toEqual({ allowedAgents: ['gemini'], preferredAgent: 'gemini', stayOnFirstUsableAgent: true }));
   });
 
+  it('setup prefers the configured CLI and can use another signed-in agent when that CLI is unavailable', async () => {
+    await withSettings({ CLAUDE_MEM_PROVIDER: 'claude' }, dir => {
+      expect(resolveRefreshAgents(dir, true)).toEqual({ preferredAgent: 'claude-code', stayOnFirstUsableAgent: true });
+    });
+    await withSettings({ CLAUDE_MEM_PROVIDER: 'claude', CLAUDE_MEM_WORK_VIEW_AGENT: 'codex' }, dir => {
+      expect(resolveRefreshAgents(dir, true).allowedAgents).toEqual(['codex']);
+    });
+  });
+
   it('an API-endpoint provider runs the first logged-in agent, whichever it is, and only that one, until the owner sets CLAUDE_MEM_WORK_VIEW_AGENT=api', async () => {
     for (const provider of ['openrouter', 'openai-compatible', 'cmem']) {
       await withSettings({ CLAUDE_MEM_PROVIDER: provider }, dir => expect(resolveRefreshAgents(dir)).toEqual({ stayOnFirstUsableAgent: true }));
-      await withSettings({ CLAUDE_MEM_PROVIDER: provider, CLAUDE_MEM_WORK_VIEW_AGENT: 'api' }, dir => expect(resolveRefreshAgents(dir)).toEqual({ allowedAgents: ['api'], preferredAgent: 'api', stayOnFirstUsableAgent: true }));
+      await withSettings({ CLAUDE_MEM_PROVIDER: provider, CLAUDE_MEM_WORK_VIEW_AGENT: 'api' }, dir => expect(resolveRefreshAgents(dir)).toEqual({ allowedAgents: ['api'], preferredAgent: 'api', stayOnFirstUsableAgent: true, apiLimits: { timeoutMs: 600_000, maxOutputTokens: 16_000 } }));
     }
   });
 
   it('CLAUDE_MEM_WORK_VIEW_AGENT picks the agent, turns the runs off, or opts into falling through', async () => {
     await withSettings({ CLAUDE_MEM_PROVIDER: 'claude', CLAUDE_MEM_WORK_VIEW_AGENT: 'codex' }, dir => expect(resolveRefreshAgents(dir)).toEqual({ allowedAgents: ['codex'], preferredAgent: 'codex', stayOnFirstUsableAgent: true }));
     await withSettings({ CLAUDE_MEM_PROVIDER: 'claude', CLAUDE_MEM_WORK_VIEW_AGENT: 'off' }, dir => expect(resolveRefreshAgents(dir)).toEqual({ allowedAgents: [], stayOnFirstUsableAgent: true }));
-    await withSettings({ CLAUDE_MEM_PROVIDER: 'codex', CLAUDE_MEM_WORK_VIEW_AGENT: 'all' }, dir => expect(resolveRefreshAgents(dir)).toEqual({ preferredAgent: 'codex', stayOnFirstUsableAgent: false }));
+    await withSettings({ CLAUDE_MEM_PROVIDER: 'codex', CLAUDE_MEM_WORK_VIEW_AGENT: 'all' }, dir => expect(resolveRefreshAgents(dir)).toEqual({ preferredAgent: 'codex', stayOnFirstUsableAgent: false, apiLimits: { timeoutMs: 600_000, maxOutputTokens: 16_000 } }));
     // 'all' is the owner's explicit choice of every logged-in local agent, API install or not.
-    await withSettings({ CLAUDE_MEM_PROVIDER: 'openrouter', CLAUDE_MEM_WORK_VIEW_AGENT: 'all' }, dir => expect(resolveRefreshAgents(dir)).toEqual({ preferredAgent: undefined, stayOnFirstUsableAgent: false }));
+    await withSettings({ CLAUDE_MEM_PROVIDER: 'openrouter', CLAUDE_MEM_WORK_VIEW_AGENT: 'all' }, dir => expect(resolveRefreshAgents(dir)).toEqual({ preferredAgent: undefined, stayOnFirstUsableAgent: false, apiLimits: { timeoutMs: 600_000, maxOutputTokens: 16_000 } }));
   });
 
   it('an unrecognized CLAUDE_MEM_WORK_VIEW_AGENT is logged and the provider decides', async () => {

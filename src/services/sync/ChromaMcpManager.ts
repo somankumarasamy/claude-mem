@@ -9,6 +9,7 @@ import os from 'os';
 import fs from 'fs';
 import { randomUUID } from 'crypto';
 import { logger } from '../../utils/logger.js';
+import { resolveBoundedNumber } from '../../shared/bounded-setting.js';
 import { SettingsDefaultsManager } from '../../shared/SettingsDefaultsManager.js';
 import { USER_SETTINGS_PATH, paths } from '../../shared/paths.js';
 import { getUvxBinDirs } from '../../shared/uvx-bin-dirs.js';
@@ -19,7 +20,7 @@ import { sanitizeEnv } from '../../supervisor/env-sanitizer.js';
 import { getSupervisor } from '../../supervisor/index.js';
 import { captureProcessName, captureProcessStartToken, isSameProcess, isSameProcessName, isSameProcessStartToken, isPidAlive, normalizeProcessName } from '../../supervisor/process-registry.js';
 import { clearDependencyStatus, recordChromaVectorSearchUnavailable, recordUvxVectorSearchUnavailable } from '../../shared/dependency-health.js';
-import { ChromaUnavailableError } from '../worker/search/errors.js';
+import { ChromaDeleteOutcomeUnknownError, ChromaUnavailableError } from '../worker/search/errors.js';
 import type { ChromaCollectionDrop } from './ChromaSync.js';
 
 const execFileAsync = promisify(execFile);
@@ -29,7 +30,38 @@ const CHROMA_MCP_CLIENT_VERSION = '1.0.0';
 const MCP_CONNECTION_TIMEOUT_MS = 30_000;
 const DEFAULT_CHROMA_PREWARM_TIMEOUT_MS = 120_000;
 const CHROMA_PREWARM_TIMEOUT_SETTING = 'CLAUDE_MEM_CHROMA_PREWARM_TIMEOUT_MS';
-const CHROMA_PREWARM_TIMEOUT_BOUNDS = { min: 1, max: 600_000 } as const;
+// 10 is nice(1)'s own default increment; 19 is the POSIX maximum niceness.
+const DEFAULT_CHROMA_PROCESS_NICE = 10;
+const CHROMA_PROCESS_NICE_SETTING = 'CLAUDE_MEM_CHROMA_PROCESS_NICE';
+const CHROMA_PROCESS_NICE_BOUNDS = { min: 0, max: 19, integer: true } as const;
+// Off by default (0): commit 39f110260 removed an always-on 2-thread cap
+// because it slowed initial backfill 3-6x on multi-core machines, so the
+// sidecar defers to the OS scheduler unless the user opts in. 2 is the
+// suggested value where chroma-mcp pins cores during backfill (#6365).
+const DEFAULT_CHROMA_MAX_THREADS = 0;
+const CHROMA_MAX_THREADS_SETTING = 'CLAUDE_MEM_CHROMA_MAX_THREADS';
+// 8192 is the Linux kernel's largest NR_CPUS (CONFIG_MAXSMP): no machine has
+// more CPUs to cap to, and Linux CPU IDs run 0..8191.
+const LINUX_MAX_CPUS = 8192;
+const CHROMA_MAX_THREADS_BOUNDS = { min: 0, max: LINUX_MAX_CPUS, integer: true } as const;
+// Only variables the chroma-mcp 0.2.6 stack reads (chromadb 1.5.9's ONNX
+// all-MiniLM-L6-v2 embedder, onnxruntime, tokenizers, numpy), checked against
+// the shipped wheels and measured on Linux aarch64 (#6369):
+// - ORT_INTRA_OP_NUM_THREADS: onnxruntime reads it when the session leaves
+//   intra_op_num_threads at 0, as chromadb's embedder does. This is the one
+//   that caps CPU: embedding fell from 7.5 to 2.0 cores used on 10 CPUs.
+// - OPENBLAS_NUM_THREADS: numpy's bundled OpenBLAS (Linux, Windows).
+// - VECLIB_MAXIMUM_THREADS: Apple Accelerate, numpy's BLAS on macOS.
+// - RAYON_NUM_THREADS: the Rust thread pool in tokenizers and chromadb's core.
+// MKL, NumExpr and an OpenMP runtime are not in the stack, and chromadb runs
+// onnxruntime sequentially, so their variables would be no-ops.
+const CHROMA_THREAD_COUNT_ENV_VARS = [
+  'ORT_INTRA_OP_NUM_THREADS',
+  'OPENBLAS_NUM_THREADS',
+  'VECLIB_MAXIMUM_THREADS',
+  'RAYON_NUM_THREADS',
+] as const;
+const CHROMA_PREWARM_TIMEOUT_BOUNDS = { min: 1, max: 600_000, integer: true } as const;
 const DEFAULT_CHROMA_MUTATION_TIMEOUT_MS = 600_000;
 const CHROMA_MUTATION_TIMEOUT_BOUNDS = { min: 60_000, max: 3_600_000 } as const;
 const CHROMA_PREWARM_REAP_TIMEOUT_MS = 1_000;
@@ -97,6 +129,9 @@ const DEFAULT_MAX_PENDING_MUTATIONS = 5_000;
 const CHROMA_MUTATION_TOOL_PATTERN = /^chroma_(?:add|create|delete|modify|update|upsert)_/;
 
 const CHROMA_MCP_PINNED_VERSION = '0.2.6';
+// chroma-mcp 0.2.6 chroma_list_collections returns this lone name when the
+// database has no collections (chroma_mcp/server.py).
+const CHROMA_NO_COLLECTIONS_SENTINEL = '__NO_COLLECTIONS_FOUND__';
 
 // Override transitive dep resolutions for chroma-mcp 0.2.6 (issue #2371).
 //
@@ -291,6 +326,9 @@ export class ChromaMcpManager {
   private pendingMutationCalls = 0;
   /** Mutation requests sent to chroma-mcp and not yet answered, in either Chroma mode. */
   private mutationCallsInFlight = 0;
+  /** Resolves when `mutationCallsInFlight` next reaches zero. Already resolved at zero. */
+  private mutationIdle: Promise<void> = Promise.resolve();
+  private resolveMutationIdle: (() => void) | null = null;
   /**
    * The transport on which a write outlived its deadline. chroma-mcp runs one
    * request at a time (its tools call the blocking Chroma client), so that
@@ -298,12 +336,32 @@ export class ChromaMcpManager {
    * the same transport; until then a read timeout never restarts it.
    */
   private timedOutWriteTransport: unknown = null;
+  /**
+   * A read timed out on this transport while a write was still in flight.
+   * The SDK had already sent `notifications/cancelled`, and chroma-mcp's
+   * stdin_reader then raises anyio.BrokenResourceError on the next message.
+   * The subprocess stays up until those writes finish — killing it mid-commit
+   * corrupts the index — and the next call restarts it before writing here.
+   */
+  private readTimeoutRestart: { transport: unknown; toolName: string } | null = null;
+  /**
+   * The single call allowed to write stdin after a cancelled read while a
+   * timed-out write may still be committing. Its answer is the probe that
+   * shows the commit finished; further callers wait instead of probing too.
+   */
+  private cancelledStdinProbe = false;
+  /** One wait-then-restart, so a second caller cannot write the cancelled stdin. */
+  private stdinRecovery: Promise<void> | null = null;
   private readonly maxPendingMutationCalls: number;
   private readonly mutationTimeoutMs: number;
   private readonly serializeMutations: boolean;
   private acceptingLocalMutations = true;
   private chromaCrashCount = 0;
   private chromaLastExit: ChromaCrashState['lastExit'] = null;
+  private static niceAvailabilityProbe: ((env: Record<string, string>, platform: NodeJS.Platform) => boolean) | null = null;
+  private static tasksetAvailabilityProbe: ((env: Record<string, string>, platform: NodeJS.Platform) => boolean) | null = null;
+  private static allowedCpusProbe: (() => number[]) | null = null;
+  private static procSelfStatusPath = '/proc/self/status';
   private static uvxAvailabilityProbe: ((command: string, env: Record<string, string>, platform: NodeJS.Platform) => boolean) | null = null;
   private static exitObserveTimeoutMs = CHROMA_EXIT_OBSERVE_TIMEOUT_MS;
   private static prewarmReapTimeoutMs = CHROMA_PREWARM_REAP_TIMEOUT_MS;
@@ -439,7 +497,8 @@ export class ChromaMcpManager {
     }
 
     const commandArgs = this.buildCommandArgs(localChromaDataDir);
-    const uvxPreflightEnv = ChromaMcpManager.getUvxPreflightEnv();
+    const maxThreads = ChromaMcpManager.resolveMaxThreads();
+    const uvxPreflightEnv = ChromaMcpManager.getUvxPreflightEnv(maxThreads);
     getSupervisor().assertCanSpawn('chroma mcp');
 
     // Spawn uvx DIRECTLY (no `cmd.exe` shell wrapper). On Windows, routing through
@@ -458,7 +517,14 @@ export class ChromaMcpManager {
 
     const spawnEnvironment = this.getSpawnEnv(uvxPreflightEnv);
 
-    await this.prewarmChromaMcp(uvxSpawnCommand, uvxSpawnArgs, spawnEnvironment, connectionGeneration);
+    // One wrapped launch shared by the prewarm and the transport spawn: the
+    // opt-in Linux CPU-affinity cap (`taskset`) inside low-priority `nice` (#6365).
+    const tasksetLaunch = ChromaMcpManager.wrapWithTaskset(
+      uvxSpawnCommand, uvxSpawnArgs, spawnEnvironment, process.platform, maxThreads);
+    const { command: launchCommand, args: launchArgs } = ChromaMcpManager.wrapWithNice(
+      tasksetLaunch.command, tasksetLaunch.args, spawnEnvironment, process.platform);
+
+    await this.prewarmChromaMcp(launchCommand, launchArgs, spawnEnvironment, connectionGeneration);
     this.assertConnectionNotCancelled(connectionGeneration);
 
     clearDependencyStatus('uvx');
@@ -493,8 +559,8 @@ export class ChromaMcpManager {
       }
 
       this.transport = new StdioClientTransport({
-        command: uvxSpawnCommand,
-        args: uvxSpawnArgs,
+        command: launchCommand,
+        args: launchArgs,
         env: spawnEnvironment,
         cwd: os.homedir(),
         stderr: 'pipe'
@@ -1081,39 +1147,11 @@ export class ChromaMcpManager {
     return [...launcherPrefix, '--help'];
   }
 
-  private static parseBoundedTimeoutMs(rawValue: string | undefined): number | null {
-    if (!rawValue) {
-      return null;
-    }
-    const parsed = Number.parseInt(rawValue, 10);
-    if (
-      Number.isFinite(parsed) &&
-      parsed >= CHROMA_PREWARM_TIMEOUT_BOUNDS.min &&
-      parsed <= CHROMA_PREWARM_TIMEOUT_BOUNDS.max
-    ) {
-      return parsed;
-    }
-    return null;
-  }
-
   private static getChromaPrewarmTimeoutMs(): number {
     const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
-    const envValue = process.env[CHROMA_PREWARM_TIMEOUT_SETTING];
-    const settingsValue = settings[CHROMA_PREWARM_TIMEOUT_SETTING];
-
-    const parsed = ChromaMcpManager.parseBoundedTimeoutMs(envValue ?? settingsValue);
-    if (parsed !== null) {
-      return parsed;
-    }
-
-    if (envValue !== undefined || settingsValue) {
-      logger.warn('CHROMA_MCP', `Invalid ${CHROMA_PREWARM_TIMEOUT_SETTING}, using default`, {
-        value: envValue ?? settingsValue,
-        min: CHROMA_PREWARM_TIMEOUT_BOUNDS.min,
-        max: CHROMA_PREWARM_TIMEOUT_BOUNDS.max
-      });
-    }
-    return DEFAULT_CHROMA_PREWARM_TIMEOUT_MS;
+    const raw = process.env[CHROMA_PREWARM_TIMEOUT_SETTING] ?? settings[CHROMA_PREWARM_TIMEOUT_SETTING];
+    return resolveBoundedNumber('CHROMA_MCP', CHROMA_PREWARM_TIMEOUT_SETTING, raw,
+      CHROMA_PREWARM_TIMEOUT_BOUNDS, DEFAULT_CHROMA_PREWARM_TIMEOUT_MS);
   }
 
   private static captureOutputTail(
@@ -1468,8 +1506,23 @@ export class ChromaMcpManager {
   }
 
   private async callToolUnqueued(toolName: string, toolArguments: Record<string, unknown>): Promise<unknown> {
+    // A previous read already cancelled its request. Wait for in-flight writes,
+    // restart, and only then send — never write a server that can no longer read.
+    // The generation is taken before that wait, so a call parked there while
+    // stop() runs is cancelled instead of reconnecting after shutdown.
     const callGeneration = this.connectionGeneration;
-    await this.ensureConnected();
+    const ownsCancelledStdinProbe = await this.prepareTransportAfterReadTimeout(callGeneration);
+    try {
+      if (callGeneration !== this.connectionGeneration) {
+        throw new ChromaMcpConnectionCancelledError('chroma-mcp call cancelled during shutdown');
+      }
+      await this.ensureConnected();
+    } catch (error) {
+      if (ownsCancelledStdinProbe) {
+        this.cancelledStdinProbe = false;
+      }
+      throw error;
+    }
     const callTransport = this.transport;
     const isMutation = ChromaMcpManager.isMutationTool(toolName);
 
@@ -1479,7 +1532,12 @@ export class ChromaMcpManager {
     // SQLite/FTS5 may still be committing can leave the persistent index
     // malformed (a timeout is therefore never handled as a transport error,
     // see below). Give mutations a bounded, configurable deadline while
-    // keeping read/query latency at the SDK default.
+    // keeping read/query latency at the SDK default. A read past that default
+    // with no write in flight is treated as hung and restarts chroma-mcp, so
+    // it must stay well above a slow-but-healthy query: a search that cannot
+    // wait that long stops waiting on its own (CHROMA_SEARCH_BUDGET_MS)
+    // without cancelling the read. A read that does hit this deadline while
+    // a write is in flight does not restart until that write settles.
     const requestOptions = isMutation
       ? { timeout: this.mutationTimeoutMs }
       : undefined;
@@ -1491,7 +1549,7 @@ export class ChromaMcpManager {
 
     let result;
     if (isMutation) {
-      this.mutationCallsInFlight += 1;
+      this.beginMutation();
     }
     try {
       result = await this.client!.callTool({
@@ -1510,22 +1568,38 @@ export class ChromaMcpManager {
         } else if (this.mutationCallsInFlight === 0 && this.timedOutWriteTransport !== callTransport) {
           await this.restartHungSubprocess(toolName, callTransport);
           throw new ChromaUnavailableError(`chroma-mcp did not answer "${toolName}" in time and was restarted`, cause);
+        } else if (!isMutation && callTransport) {
+          // Every read that did not restart immediately has already sent
+          // notifications/cancelled, including one queued behind a write that
+          // itself timed out and may still be committing. Arm the settled
+          // restart. Do not kill mid-commit; the next call waits, or sends the
+          // one probe that shows the commit finished, and the restart follows
+          // that answer.
+          this.readTimeoutRestart = { transport: callTransport, toolName };
         }
         // A request that outlived its deadline while a write is, or may still
         // be, in flight means chroma-mcp is slow, not gone: the SDK has already
         // sent notifications/cancelled, and the write may still be committing.
         // Tree-killing it here is what leaves a persistent index malformed,
         // and a retry would repeat the same slow work, so neither happens.
-        // The caller keeps the row pending.
+        // The caller keeps the row pending. A cancelled read is restarted once
+        // that write settles (see readTimeoutRestart).
         const message = `chroma-mcp "${toolName}" timed out; the subprocess was left running`;
         logger.warn('CHROMA_MCP', message, {
           timeoutMs: requestOptions?.timeout,
+          restartAfterWritesSettle: this.readTimeoutRestart?.transport === callTransport,
           error: transportError instanceof Error ? transportError.message : String(transportError)
         });
+        if (toolName === 'chroma_delete_collection') {
+          throw new ChromaDeleteOutcomeUnknownError(message, cause);
+        }
         throw new ChromaUnavailableError(message, cause);
       }
 
-      logger.warn('CHROMA_MCP', `Transport error during "${toolName}", reconnecting and retrying once`, {
+      const action = toolName === 'chroma_delete_collection'
+        ? 'leaving delete outcome unconfirmed'
+        : 'reconnecting and retrying once';
+      logger.warn('CHROMA_MCP', `Transport error during "${toolName}", ${action}`, {
         error: transportError instanceof Error ? transportError.message : String(transportError)
       });
       // A lost transport is a connection failure even when this call's retry
@@ -1548,6 +1622,15 @@ export class ChromaMcpManager {
         await this.disposeCurrentSubprocess();
       }
 
+      // Destructive deletion cannot be safely replayed after losing its reply.
+      // The caller verifies collection existence before deciding what to do next.
+      if (toolName === 'chroma_delete_collection') {
+        throw new ChromaDeleteOutcomeUnknownError(
+          'Collection deletion outcome is unconfirmed after transport loss',
+          transportError instanceof Error ? transportError : undefined
+        );
+      }
+
       try {
         if (callGeneration !== this.connectionGeneration) {
           throw new ChromaMcpConnectionCancelledError('chroma-mcp call cancelled during shutdown');
@@ -1563,7 +1646,21 @@ export class ChromaMcpManager {
       }
     } finally {
       if (isMutation) {
-        this.mutationCallsInFlight -= 1;
+        this.endMutation();
+      }
+      // A read may have cancelled stdin while this write was the one in flight.
+      // Restart only after the write has settled, and never instead of its result.
+      // Skip the await on the common path so a call with nothing pending does
+      // not add a scheduling hop.
+      if (this.readTimeoutRestart) {
+        await this.restartCancelledStdinIfSettled(callGeneration);
+      }
+      // Drop the probe permit only after the settled restart has started, so
+      // a second caller cannot write the cancelled stdin while this answer
+      // is still tearing the subprocess down. Only the call that took the
+      // permit releases it: an older read timing out meanwhile must not.
+      if (ownsCancelledStdinProbe) {
+        this.cancelledStdinProbe = false;
       }
     }
 
@@ -1576,6 +1673,30 @@ export class ChromaMcpManager {
     const contentArray = result.content as Array<{ type: string; text?: string }>;
     if (!contentArray || contentArray.length === 0) {
       return null;
+    }
+
+    // The pinned chroma-mcp sends one plain-text MCP content block per
+    // collection name, not a JSON array. Preserve every name (not just the
+    // first) so recovery can verify deletion against the complete listing.
+    // An empty database answers with the lone CHROMA_NO_COLLECTIONS_SENTINEL,
+    // which means no collections, not one.
+    if (toolName === 'chroma_list_collections') {
+      const blocks = contentArray.filter(item => item.type === 'text' && typeof item.text === 'string');
+      if (blocks.length !== contentArray.length || blocks.some(item => !item.text)) {
+        return null;
+      }
+      if (blocks.length === 1 && blocks[0].text === CHROMA_NO_COLLECTIONS_SENTINEL) {
+        return [];
+      }
+      if (blocks.length === 1) {
+        try {
+          const parsed = JSON.parse(blocks[0].text!);
+          if (Array.isArray(parsed)) return parsed;
+        } catch {
+          // A raw collection name is not JSON.
+        }
+      }
+      return blocks.map(item => item.text);
     }
 
     const firstTextContent = contentArray.find(item => item.type === 'text' && item.text);
@@ -1633,6 +1754,113 @@ export class ChromaMcpManager {
 
   private static isRequestTimeout(error: unknown): boolean {
     return error instanceof McpError && error.code === ErrorCode.RequestTimeout;
+  }
+
+  private beginMutation(): void {
+    this.mutationCallsInFlight += 1;
+    if (this.mutationCallsInFlight === 1) {
+      this.mutationIdle = new Promise(resolve => {
+        this.resolveMutationIdle = resolve;
+      });
+    }
+  }
+
+  private endMutation(): void {
+    if (this.mutationCallsInFlight > 0) {
+      this.mutationCallsInFlight -= 1;
+    }
+    if (this.mutationCallsInFlight === 0) {
+      const resolve = this.resolveMutationIdle;
+      this.resolveMutationIdle = null;
+      this.mutationIdle = Promise.resolve();
+      resolve?.();
+    }
+  }
+
+  /**
+   * Before sending, restart a chroma-mcp whose stdin a timed-out read already
+   * cancelled, once every in-flight write has finished.
+   *
+   * While a write is still in flight this waits and does not send. A write
+   * that itself timed out has no in-flight handle left and may still be
+   * committing, so that one probe is still allowed through: its answer is
+   * what shows the commit finished, and the restart follows the answer.
+   *
+   * Returns true when this call took that probe permit; the caller then owns
+   * it and is the only one that releases it.
+   */
+  private async prepareTransportAfterReadTimeout(callGeneration: number): Promise<boolean> {
+    if (this.stdinRecovery) {
+      await this.stdinRecovery;
+    }
+    const pending = this.readTimeoutRestart;
+    if (!pending) return false;
+
+    let release!: () => void;
+    const recovery = new Promise<void>(resolve => {
+      release = resolve;
+    });
+    this.stdinRecovery = recovery;
+    try {
+      while (this.readTimeoutRestart === pending) {
+        if (callGeneration !== this.connectionGeneration || !this.transport || this.transport !== pending.transport) {
+          this.readTimeoutRestart = null;
+          return false;
+        }
+        if (this.mutationCallsInFlight > 0) {
+          await this.mutationIdle;
+          continue;
+        }
+        if (this.timedOutWriteTransport === pending.transport) {
+          // One probe. A second caller must not write the cancelled stdin.
+          if (this.cancelledStdinProbe) {
+            throw new ChromaUnavailableError(
+              'chroma-mcp stdin was cancelled and a probe is already in flight',
+            );
+          }
+          this.cancelledStdinProbe = true;
+          return true;
+        }
+        await this.restartCancelledStdinIfSettled(callGeneration);
+        return false;
+      }
+      return false;
+    } finally {
+      if (this.stdinRecovery === recovery) {
+        this.stdinRecovery = null;
+      }
+      release();
+    }
+  }
+
+  /**
+   * Restart the subprocess a timed-out read marked, now that no write is in
+   * flight and no timed-out write is still waiting for an answer. A failure
+   * here must not replace the call's own result or timeout error.
+   */
+  private async restartCancelledStdinIfSettled(callGeneration: number): Promise<void> {
+    const pending = this.readTimeoutRestart;
+    if (!pending) return;
+    if (callGeneration !== this.connectionGeneration) {
+      this.readTimeoutRestart = null;
+      return;
+    }
+    if (!this.transport || pending.transport !== this.transport) {
+      this.readTimeoutRestart = null;
+      return;
+    }
+    if (this.mutationCallsInFlight > 0 || this.timedOutWriteTransport === pending.transport) {
+      return;
+    }
+    this.readTimeoutRestart = null;
+    try {
+      await this.restartHungSubprocess(pending.toolName, pending.transport);
+    } catch (error) {
+      logger.warn('CHROMA_MCP', 'Restart after a timed-out chroma-mcp read did not finish', {
+        toolName: pending.toolName,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 
   /**
@@ -1855,6 +2083,11 @@ export class ChromaMcpManager {
     this.client = null;
     this.transport = null;
     this.connected = false;
+    // This subprocess is gone. A later call must not treat it as still
+    // committing, and must not restart whatever replaced it.
+    this.readTimeoutRestart = null;
+    this.timedOutWriteTransport = null;
+    this.cancelledStdinProbe = false;
   }
 
   /**
@@ -2228,6 +2461,168 @@ export class ChromaMcpManager {
     return false;
   }
 
+  private static resolveMaxThreads(): number {
+    const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
+    return resolveBoundedNumber(
+      'CHROMA_MCP', CHROMA_MAX_THREADS_SETTING, settings[CHROMA_MAX_THREADS_SETTING],
+      CHROMA_MAX_THREADS_BOUNDS, DEFAULT_CHROMA_MAX_THREADS);
+  }
+
+  /**
+   * Parses Linux procfs CPU list notation (e.g. "0-15", "0,2,4-7") into a
+   * sorted, deduplicated list of CPU IDs. Returns [] for empty or malformed
+   * input, or for an ID at or above LINUX_MAX_CPUS (no kernel can report one,
+   * so the line is not a CPU list).
+   */
+  static parseLinuxCpuList(spec: string): number[] {
+    const trimmed = spec.trim();
+    if (!trimmed) return [];
+    const cpus = new Set<number>();
+    for (const part of trimmed.split(',')) {
+      const token = part.trim();
+      const rangeMatch = /^(\d+)(?:-(\d+))?$/.exec(token);
+      if (!rangeMatch) return [];
+      const start = Number(rangeMatch[1]);
+      const end = rangeMatch[2] === undefined ? start : Number(rangeMatch[2]);
+      if (end < start || end >= LINUX_MAX_CPUS) return [];
+      for (let cpu = start; cpu <= end; cpu += 1) {
+        cpus.add(cpu);
+      }
+    }
+    return [...cpus].sort((a, b) => a - b);
+  }
+
+  /**
+   * The CPUs this process may run on, from `Cpus_allowed_list` in
+   * /proc/self/status. Never guesses: in a cpuset-restricted container a
+   * guessed `taskset -c 0,1` fails and chroma-mcp never starts, so an
+   * unreadable or unparseable list returns a reason instead.
+   */
+  private static readAllowedLinuxCpus(): { cpus: number[] } | { unknownReason: string } {
+    if (ChromaMcpManager.allowedCpusProbe) {
+      const cpus = ChromaMcpManager.allowedCpusProbe();
+      return cpus.length > 0 ? { cpus } : { unknownReason: 'allowed-CPU probe returned no CPUs' };
+    }
+    let status: string;
+    try {
+      status = fs.readFileSync(ChromaMcpManager.procSelfStatusPath, 'utf8');
+    } catch (error) {
+      return { unknownReason: `cannot read ${ChromaMcpManager.procSelfStatusPath}: ${error instanceof Error ? error.message : String(error)}` };
+    }
+    const line = status.split('\n').find(entry => entry.startsWith('Cpus_allowed_list:'));
+    if (!line) {
+      return { unknownReason: `${ChromaMcpManager.procSelfStatusPath} has no Cpus_allowed_list line` };
+    }
+    const value = line.slice('Cpus_allowed_list:'.length).trim();
+    const cpus = ChromaMcpManager.parseLinuxCpuList(value);
+    return cpus.length > 0 ? { cpus } : { unknownReason: `cannot parse Cpus_allowed_list "${value}"` };
+  }
+
+  private static isExecutableOnPath(binary: string, env: Record<string, string>): boolean {
+    const pathKey = Object.keys(env).find(k => k.toLowerCase() === 'path') ?? 'PATH';
+    return (env[pathKey] ?? '').split(':').filter(Boolean).some(dir => {
+      const candidate = path.join(dir, binary);
+      try {
+        if (!fs.statSync(candidate).isFile()) return false;
+        fs.accessSync(candidate, fs.constants.X_OK);
+        return true;
+      } catch {
+        // A missing or unreadable entry just means the binary is not in this dir, so false is safe.
+        return false;
+      }
+    });
+  }
+
+  /**
+   * Opt-in hard cap on Linux: `taskset -c <first maxThreads allowed CPUs>
+   * <command> ...args`, so every thread and multiprocessing child of
+   * chroma-mcp inherits the affinity mask whatever its thread pools do (#6365).
+   * taskset execs the target in place, so the tracked pid is unchanged.
+   * Skipped, with a warning, when the allowed CPU list is unknown.
+   */
+  private static wrapWithTaskset(
+    command: string,
+    args: string[],
+    env: Record<string, string>,
+    platform: NodeJS.Platform,
+    maxThreads: number,
+  ): { command: string; args: string[] } {
+    if (platform !== 'linux' || maxThreads <= 0 || !ChromaMcpManager.isTasksetAvailable(env, platform)) {
+      return { command, args };
+    }
+    const allowed = ChromaMcpManager.readAllowedLinuxCpus();
+    if ('unknownReason' in allowed) {
+      logger.warn('CHROMA_MCP', 'CPU affinity cap skipped: allowed CPU list unknown', {
+        reason: allowed.unknownReason,
+        [CHROMA_MAX_THREADS_SETTING]: maxThreads,
+      });
+      return { command, args };
+    }
+    if (allowed.cpus.length <= maxThreads) {
+      return { command, args };
+    }
+    const cpuList = allowed.cpus.slice(0, maxThreads).join(',');
+    return { command: 'taskset', args: ['-c', cpuList, command, ...args] };
+  }
+
+  private static isTasksetAvailable(env: Record<string, string>, platform: NodeJS.Platform): boolean {
+    if (ChromaMcpManager.tasksetAvailabilityProbe) {
+      return ChromaMcpManager.tasksetAvailabilityProbe(env, platform);
+    }
+    return ChromaMcpManager.isExecutableOnPath('taskset', env);
+  }
+
+  /**
+   * Starts chroma-mcp at low priority: `nice -n N <command> ...args` on
+   * non-Windows hosts where `nice` resolves on PATH. nice execs the target, so
+   * the pid stays the same and process tracking is unaffected.
+   */
+  private static wrapWithNice(
+    command: string,
+    args: string[],
+    env: Record<string, string>,
+    platform: NodeJS.Platform,
+  ): { command: string; args: string[] } {
+    if (platform === 'win32') {
+      return { command, args };
+    }
+    const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
+    const niceness = resolveBoundedNumber(
+      'CHROMA_MCP', CHROMA_PROCESS_NICE_SETTING, settings[CHROMA_PROCESS_NICE_SETTING],
+      CHROMA_PROCESS_NICE_BOUNDS, DEFAULT_CHROMA_PROCESS_NICE);
+    if (niceness === 0 || !ChromaMcpManager.isNiceAvailable(env, platform)) {
+      return { command, args };
+    }
+    return { command: 'nice', args: ['-n', String(niceness), command, ...args] };
+  }
+
+  private static isNiceAvailable(env: Record<string, string>, platform: NodeJS.Platform): boolean {
+    if (ChromaMcpManager.niceAvailabilityProbe) {
+      return ChromaMcpManager.niceAvailabilityProbe(env, platform);
+    }
+    return ChromaMcpManager.isExecutableOnPath('nice', env);
+  }
+
+  static setNiceAvailabilityProbeForTesting(
+    probe: ((env: Record<string, string>, platform: NodeJS.Platform) => boolean) | null,
+  ): void {
+    ChromaMcpManager.niceAvailabilityProbe = probe;
+  }
+
+  static setTasksetAvailabilityProbeForTesting(
+    probe: ((env: Record<string, string>, platform: NodeJS.Platform) => boolean) | null,
+  ): void {
+    ChromaMcpManager.tasksetAvailabilityProbe = probe;
+  }
+
+  static setAllowedCpusProbeForTesting(probe: (() => number[]) | null): void {
+    ChromaMcpManager.allowedCpusProbe = probe;
+  }
+
+  static setProcSelfStatusPathForTesting(statusPath: string | null): void {
+    ChromaMcpManager.procSelfStatusPath = statusPath ?? '/proc/self/status';
+  }
+
   static setUvxAvailabilityProbeForTesting(
     probe: ((command: string, env: Record<string, string>, platform: NodeJS.Platform) => boolean) | null,
   ): void {
@@ -2265,7 +2660,62 @@ export class ChromaMcpManager {
     }
   }
 
-  private static getUvxPreflightEnv(): Record<string, string> {
+  private static setDefaultEnv(
+    env: Record<string, string>,
+    name: string,
+    value: string,
+    platform: NodeJS.Platform = process.platform,
+  ): void {
+    if (platform === 'win32') {
+      const target = name.toLowerCase();
+      const existing = Object.keys(env).find(key => key.toLowerCase() === target);
+      if (existing && env[existing]) return;
+      if (existing) delete env[existing];
+      env[name] = value;
+      return;
+    }
+    if (!env[name]) {
+      env[name] = value;
+    }
+  }
+
+  /**
+   * Caps the onnxruntime, BLAS and Rayon thread pools of the spawned
+   * chroma-mcp sidecar at `maxThreads` (see CHROMA_THREAD_COUNT_ENV_VARS).
+   * Explicit user values already present in the environment win.
+   */
+  private static applyChromaThreadLimits(
+    env: Record<string, string>,
+    maxThreads: number,
+    platform: NodeJS.Platform = process.platform,
+  ): void {
+    if (maxThreads <= 0) return;
+    const threads = String(maxThreads);
+    for (const key of CHROMA_THREAD_COUNT_ENV_VARS) {
+      ChromaMcpManager.setDefaultEnv(env, key, threads, platform);
+    }
+  }
+
+  /**
+   * Rewrite bare bracketed IPv6 entries in NO_PROXY / no_proxy (`[::1]`) to the
+   * unbracketed address (`::1`), which means the same host to every proxy
+   * reader. httpx's `get_environment_proxies` misreads the bracketed form as a
+   * domain and builds a URL whose port is `:1]`, so chroma-mcp could not add
+   * documents. Entries with a port, and every other entry, are left as they are.
+   */
+  private static unbracketNoProxyIpv6(env: Record<string, string>): void {
+    for (const key of Object.keys(env)) {
+      if (key.toLowerCase() !== 'no_proxy') continue;
+      env[key] = env[key]
+        .split(',')
+        .map(entry => /^\s*\[([0-9A-Fa-f:.]+)\]\s*$/.exec(entry)?.[1] ?? entry)
+        .join(',');
+    }
+  }
+
+  private static getUvxPreflightEnv(
+    maxThreads: number = ChromaMcpManager.resolveMaxThreads(),
+  ): Record<string, string> {
     const baseEnv: Record<string, string> = {};
     for (const [key, value] of Object.entries(sanitizeEnv(process.env))) {
       if (value !== undefined) {
@@ -2295,6 +2745,14 @@ export class ChromaMcpManager {
         && !Object.keys(baseEnv).some(key => key.toLowerCase() === 'uv_link_mode')) {
       baseEnv.UV_LINK_MODE = 'copy';
     }
+
+    // A bracketed IPv6 entry such as `[::1]` in NO_PROXY makes httpx 0.28
+    // (chroma-mcp's HTTP client) fail every write with "Invalid port: ':1]'"
+    // while the embedding model downloads (#6365).
+    ChromaMcpManager.unbracketNoProxyIpv6(baseEnv);
+
+    // Opt-in (CLAUDE_MEM_CHROMA_MAX_THREADS) cap on the sidecar's thread pools (#6365).
+    ChromaMcpManager.applyChromaThreadLimits(baseEnv, maxThreads, process.platform);
 
     // Disable Chroma's anonymous telemetry — it issues background HTTP from
     // the embedding subprocess on every collection touch.

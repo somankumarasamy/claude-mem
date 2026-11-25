@@ -5,6 +5,7 @@ import { join } from 'path';
 import {
   envFilePath,
   buildIsolatedEnv,
+  buildOpenCodeEnv,
   buildIsolatedEnvWithFreshOAuth,
   loadClaudeMemEnv,
   saveClaudeMemEnv,
@@ -20,8 +21,11 @@ import { logger } from '../src/utils/logger.js';
 // CJS interop: the check is a .cjs module exporting findViolations.
 import { createRequire } from 'module';
 const requireCjs = createRequire(import.meta.url);
-const { findViolations } = requireCjs('../scripts/check-spawn-env-discipline.cjs') as {
-  findViolations: () => Array<{ file: string; line: number }>;
+type SpawnEnvViolation = { file: string; line: number; variable: string | null; exemptKey: string };
+const { findViolations, findViolationsInSources, unexemptedViolations } = requireCjs('../scripts/check-spawn-env-discipline.cjs') as {
+  findViolations: () => SpawnEnvViolation[];
+  findViolationsInSources: (sources: Array<{ file: string; source: string }>) => SpawnEnvViolation[];
+  unexemptedViolations: (violations: SpawnEnvViolation[]) => SpawnEnvViolation[];
 };
 
 /**
@@ -117,6 +121,22 @@ describe('Issue #2375: ANTHROPIC_BASE_URL env-var isolation', () => {
     const result = buildIsolatedEnv();
 
     expect(result.ANTHROPIC_BASE_URL).toBeUndefined();
+  });
+
+  it('keeps a shell gateway with its OpenCode key and out of the Claude Code environment', () => {
+    process.env.ANTHROPIC_API_KEY = 'shell-key';
+    process.env.ANTHROPIC_BASE_URL = 'https://shell.example';
+    const openCode = buildOpenCodeEnv();
+    expect(openCode.ANTHROPIC_API_KEY).toBe('shell-key');
+    expect(openCode.ANTHROPIC_BASE_URL).toBe('https://shell.example');
+    const claude = buildIsolatedEnv();
+    expect(claude.ANTHROPIC_API_KEY).toBeUndefined();
+    expect(claude.ANTHROPIC_BASE_URL).toBeUndefined();
+
+    fs.writeFileSync(TEST_ENV_FILE, 'ANTHROPIC_API_KEY=file-key\n');
+    const configured = buildOpenCodeEnv();
+    expect(configured.ANTHROPIC_API_KEY).toBe('file-key');
+    expect(configured.ANTHROPIC_BASE_URL).toBeUndefined();
   });
 
   it('~/.claude-mem/.env BASE_URL + AUTH_TOKEN reaches isolatedEnv', () => {
@@ -395,7 +415,50 @@ describe('Issue #5346: Observer beta opt-out propagation', () => {
 describe('spawn-env discipline (CI guard)', () => {
   it('no spawn site hands raw process.env to a child without sanitizeEnv', () => {
     const violations = findViolations();
-    expect(violations).toEqual([]);
+    // The scan now reads env blocks declared above a spawn too, which surfaced
+    // the two host-boundary spawns whose env is built in an object: the hook
+    // runner and the hook launcher hand the host environment to the worker that
+    // serves the host, and the check lists them in EXEMPT with that reason.
+    // Pinning the set here means any OTHER env-bearing spawn without
+    // sanitizeEnv fails this test, not just the check script.
+    expect(violations.map(v => v.exemptKey).sort()).toEqual([
+      'plugin/scripts/bun-runner.js#spawnOptions',
+      'src/launcher/claude-mem-launcher.ts#spawnOptions',
+    ]);
+    expect(unexemptedViolations(violations)).toEqual([]);
+  });
+
+  // The check reads a 10-line window after each spawn, so fixture blocks are
+  // spaced further apart than that to be judged one at a time.
+  const spacedFixture = (...blocks: string[][]) =>
+    blocks.map(block => block.join('\n')).join('\n' + '\n'.repeat(12));
+
+  it('judges a spawn on the nearest declaration above it, not the last one in the file', () => {
+    const source = spacedFixture(
+      ["import { spawn } from 'child_process';", 'function rawOne() {', '  const options = { env: { ...process.env } };', "  spawn('a', [], options);", '}'],
+      ['function sanitizedOne() {', '  const options = { env: sanitizeEnv(process.env) };', "  spawn('b', [], options);", '}'],
+    );
+    expect(findViolationsInSources([{ file: 'src/fixture.ts', source }])).toEqual([
+      { file: 'src/fixture.ts', line: 4, variable: 'options', exemptKey: 'src/fixture.ts#options' },
+    ]);
+  });
+
+  it('still reports a second raw-env spawn added to an exempt file', () => {
+    const source = spacedFixture(
+      ["import { spawn } from 'child_process';", 'const spawnOptions = { env: { ...process.env } };', "spawn('bun', [], spawnOptions);"],
+      ['const extraOptions = { env: { ...process.env } };', "spawn('other', [], extraOptions);"],
+      ["spawn('inline', [], { env: process.env });"],
+    );
+    const violations = findViolationsInSources([{ file: 'plugin/scripts/bun-runner.js', source }]);
+    expect(violations.map(v => v.exemptKey)).toEqual([
+      'plugin/scripts/bun-runner.js#spawnOptions',
+      'plugin/scripts/bun-runner.js#extraOptions',
+      'plugin/scripts/bun-runner.js#inline',
+    ]);
+    expect(unexemptedViolations(violations).map(v => v.exemptKey)).toEqual([
+      'plugin/scripts/bun-runner.js#extraOptions',
+      'plugin/scripts/bun-runner.js#inline',
+    ]);
   });
 });
 
@@ -952,5 +1015,98 @@ describe('Issue #5400: observer spawn inherits proxy env from Claude settings', 
     const fromDotenv = buildIsolatedEnv();
     expect(fromDotenv.HTTPS_PROXY).toBeUndefined();
     expect(fromDotenv.ANTHROPIC_API_KEY).toBe('sk-ant-key');
+  });
+});
+
+/**
+ * #6319 — when the credential store held no usable login, the read was logged
+ * only at DEBUG, so the INFO log went quiet while every observer call answered
+ * "Not logged in". It is a WARN now whenever the child will run on the CLI's
+ * own login, and the spawn notes why for the session notice.
+ */
+describe('#6319: a stored login the observer cannot use is loud', () => {
+  const UNREADABLE = 'No Claude Code login could be read for the observer';
+  const absentStore: oauthToken.OAuthTokenResult = { kind: 'absent', reason: 'The credential store holds no Claude Code login (macOS keychain service "Claude Code-credentials", account=finn)' };
+  const endedStore: oauthToken.OAuthTokenResult = { kind: 'expired', reason: 'The Claude Code login stored in this credential store has ended (loginEnded=time_limit)', loginEnded: 'time_limit' };
+
+  beforeAll(() => {
+    fs.mkdirSync(TEST_DATA_DIR, { recursive: true, mode: 0o700 });
+    process.env.CLAUDE_MEM_ENV_FILE = TEST_ENV_FILE;
+  });
+
+  afterAll(() => {
+    if (ORIGINAL_ENV_FILE === undefined) delete process.env.CLAUDE_MEM_ENV_FILE;
+    else process.env.CLAUDE_MEM_ENV_FILE = ORIGINAL_ENV_FILE;
+  });
+
+  beforeEach(() => {
+    clearEnvFile();
+    clearAnthropicEnv();
+  });
+
+  afterEach(() => {
+    clearEnvFile();
+    restoreOriginalEnv();
+  });
+
+  async function spawnWith(store: oauthToken.OAuthTokenResult, standIn?: 'subscription') {
+    const warnSpy = spyOn(logger, 'warn');
+    const oauthSpy = spyOn(oauthToken, 'readClaudeOAuthToken').mockResolvedValue(store);
+    // An expired result writes the stale-login marker; keep it out of the
+    // shared data dir, where later SessionStart tests would read it.
+    const dataDirSpy = spyOn(paths, 'dataDir').mockImplementation(() => TEST_DATA_DIR);
+    try {
+      let unusableLogin: string | null = null;
+      const env = await buildIsolatedEnvWithFreshOAuth(true, { standIn, onUnusableLogin: reason => { unusableLogin = reason; } });
+      const warnings = warnSpy.mock.calls.map(call => String(call[1]));
+      return { env, warnings, unusableLogin };
+    } finally {
+      dataDirSpy.mockRestore();
+      oauthSpy.mockRestore();
+      warnSpy.mockRestore();
+    }
+  }
+
+  it('an absent login is a WARN with the reason and the setup-token remedy, and is noted for the notice', async () => {
+    const { env, warnings, unusableLogin } = await spawnWith(absentStore);
+    expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
+    const warning = warnings.find(message => message.includes(UNREADABLE));
+    expect(warning).toContain(absentStore.reason);
+    expect(warning).toContain('claude setup-token');
+    expect(warning).toContain('CLAUDE_CODE_OAUTH_TOKEN');
+    expect(unusableLogin).toBe(absentStore.reason);
+  });
+
+  it('no such WARN when the .env API key stands in for the missing login', async () => {
+    fs.writeFileSync(TEST_ENV_FILE, 'ANTHROPIC_API_KEY=sk-ant-standin\n', { mode: 0o600 });
+    const { env, warnings, unusableLogin } = await spawnWith(absentStore, 'subscription');
+    expect(env.ANTHROPIC_API_KEY).toBe('sk-ant-standin');
+    expect(warnings.some(message => message.includes(UNREADABLE))).toBe(false);
+    expect(unusableLogin).toBeNull();
+  });
+
+  it('an ended login is noted too, and keeps the .env key a subscription stand-in can use', async () => {
+    const alone = await spawnWith(endedStore);
+    expect(alone.env.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
+    expect(alone.unusableLogin).toBe(endedStore.reason);
+
+    // An ended login has no refresh token left, so the CLI cannot renew it
+    // the way it renews a lapsed one: the key it would have billed stays.
+    fs.writeFileSync(TEST_ENV_FILE, 'ANTHROPIC_API_KEY=sk-ant-standin\n', { mode: 0o600 });
+    const standIn = await spawnWith(endedStore, 'subscription');
+    expect(standIn.env.ANTHROPIC_API_KEY).toBe('sk-ant-standin');
+    expect(standIn.unusableLogin).toBeNull();
+  });
+
+  it('a spawn that finds the login reports nothing', async () => {
+    const { env, warnings, unusableLogin } = await spawnWith({ kind: 'present', token: 'store-token', source: 'keychain' });
+    expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBe('store-token');
+    expect(warnings.some(message => message.includes(UNREADABLE))).toBe(false);
+    expect(unusableLogin).toBeNull();
+  });
+
+  it('a lapsed (not ended) login is left to the CLI refresh and is not reported', async () => {
+    const { unusableLogin } = await spawnWith({ kind: 'expired', reason: 'The Claude Code login in the credential store has expired', expiresAt: 1 });
+    expect(unusableLogin).toBeNull();
   });
 });
